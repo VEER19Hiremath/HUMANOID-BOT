@@ -1,0 +1,87 @@
+<?xml version="1.0"?>
+<robot name="custom_robo">
+
+  <!-- WORLD link removed so odom can serve as the dynamic parent TF -->
+
+  <!-- ROBOT REFERENCE FRAME (AXLE / GROUND REFERENCE) -->
+  <link name="base_footprint"/>
+
+  <!-- BASE LINK -->
+  <link name="base_link">
+    <visual>
+      <!--
+        CAD origin is at a corner.
+        X/Y shift centers the mesh.
+        Z shift is raised so the base equator aligns with wheel axle height.
+      -->
+      <origin xyz="-0.293165 -0.26707 -0.0127" rpy="1.57079632679 0 1.57079632679"/>
+      <geometry>
+        <mesh filename="package://hospital_description/meshes/base.stl"
+              scale="0.001 0.001 0.001"/>
+      </geometry>
+    </visual>
+  </link>
+
+  <joint name="base_footprint_to_base_link" type="fixed">
+    <parent link="base_footprint"/>
+    <child link="base_link"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+  </joint>
+
+  <!-- LEFT WHEEL -->
+  <link name="left_wheel">
+    <visual>
+      <origin xyz="0.0762 0 0.0762" rpy="0 1.5708 1.5708"/>
+      <geometry>
+        <mesh filename="package://hospital_description/meshes/left_wheel.stl"
+              scale="0.001 0.001 0.001"/>
+      </geometry>
+    </visual>
+  </link>
+
+  <joint name="left_wheel_joint" type="continuous">
+    <parent link="base_footprint"/>
+    <child link="left_wheel"/>
+    <origin xyz="0 0.2159 0" rpy="0 0 0"/>
+    <axis xyz="0 -1 0"/>
+  </joint>
+
+  <!-- RIGHT WHEEL -->
+  <link name="right_wheel">
+    <visual>
+      <!-- use SAME STL as left wheel, only mirrored by rotation -->
+      <origin xyz="-0.0762 0 0.0762" rpy="0 1.5708 4.7124"/>
+      <geometry>
+        <mesh filename="package://hospital_description/meshes/left_wheel.stl"
+              scale="0.001 0.001 0.001"/>
+      </geometry>
+    </visual>
+  </link>
+
+  <joint name="right_wheel_joint" type="continuous">
+    <parent link="base_footprint"/>
+    <child link="right_wheel"/>
+    <origin xyz="0 -0.2159 0" rpy="0 0 0"/>
+    <axis xyz="0 -1 0"/>
+  </joint>
+
+  <!-- RPLIDAR A2M8 -->
+  <link name="laser">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="0.035" length="0.04"/>
+      </geometry>
+      <material name="black">
+        <color rgba="0 0 0 1"/>
+      </material>
+    </visual>
+  </link>
+
+  <joint name="base_link_to_laser" type="fixed">
+    <parent link="base_link"/>
+    <child link="laser"/>
+    <origin xyz="0 0 0.15" rpy="0 0 0"/>
+  </joint>
+
+</robot>

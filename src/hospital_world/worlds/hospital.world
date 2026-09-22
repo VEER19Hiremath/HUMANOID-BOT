@@ -1,0 +1,371 @@
+<?xml version="1.0" ?>
+<sdf version="1.7">
+
+  <world name="hospital_world">
+
+    <light name="sun" type="directional">
+      <cast_shadows>true</cast_shadows>
+      <pose>0 0 10 0 0 0</pose>
+      <diffuse>0.8 0.8 0.8 1</diffuse>
+      <specular>0.2 0.2 0.2 1</specular>
+      <direction>-0.5 0.1 -0.9</direction>
+    </light>
+
+    <!-- Ground Plane -->
+    <model name="ground_plane">
+      <static>true</static>
+      <link name="link">
+        <collision name="collision">
+          <geometry>
+            <box>
+              <size>25 25 0.1</size>
+            </box>
+          </geometry>
+        </collision>
+
+        <visual name="visual">
+          <geometry>
+            <box>
+              <size>25 25 0.1</size>
+            </box>
+          </geometry>
+
+          <material>
+            <ambient>0.8 0.8 0.8 1</ambient>
+            <diffuse>0.8 0.8 0.8 1</diffuse>
+          </material>
+        </visual>
+      </link>
+
+      <pose>0 0 -0.05 0 0 0</pose>
+    </model>
+
+    <!-- North Wall -->
+    <model name="wall_north">
+      <static>true</static>
+      <pose>0 12.5 1.25 0 0 0</pose>
+
+      <link name="link">
+        <collision name="collision">
+          <geometry>
+            <box>
+              <size>25 0.2 2.5</size>
+            </box>
+          </geometry>
+        </collision>
+
+        <visual name="visual">
+          <geometry>
+            <box>
+              <size>25 0.2 2.5</size>
+            </box>
+          </geometry>
+        </visual>
+      </link>
+    </model>
+
+    <!-- South Wall -->
+    <model name="wall_south">
+      <static>true</static>
+      <pose>0 -12.5 1.25 0 0 0</pose>
+
+      <link name="link">
+        <collision name="collision">
+          <geometry>
+            <box>
+              <size>25 0.2 2.5</size>
+            </box>
+          </geometry>
+        </collision>
+
+        <visual name="visual">
+          <geometry>
+            <box>
+              <size>25 0.2 2.5</size>
+            </box>
+          </geometry>
+        </visual>
+      </link>
+    </model>
+
+    <!-- East Wall -->
+    <model name="wall_east">
+      <static>true</static>
+      <pose>12.5 0 1.25 0 0 0</pose>
+
+      <link name="link">
+        <collision name="collision">
+          <geometry>
+            <box>
+              <size>0.2 25 2.5</size>
+            </box>
+          </geometry>
+        </collision>
+
+        <visual name="visual">
+          <geometry>
+            <box>
+              <size>0.2 25 2.5</size>
+            </box>
+          </geometry>
+        </visual>
+      </link>
+    </model>
+
+    <!-- West Wall -->
+    <model name="wall_west">
+      <static>true</static>
+      <pose>-12.5 0 1.25 0 0 0</pose>
+
+      <link name="link">
+        <collision name="collision">
+          <geometry>
+            <box>
+              <size>0.2 25 2.5</size>
+            </box>
+          </geometry>
+        </collision>
+
+        <visual name="visual">
+          <geometry>
+            <box>
+              <size>0.2 25 2.5</size>
+            </box>
+          </geometry>
+        </visual>
+      </link>
+    </model>
+
+    <!-- ROOM 1 BOTTOM WALL WITH DOOR -->
+    <model name="room1_left">
+    <static>true</static>
+    <pose>-4 5 1.25 0 0 0</pose>
+    <link name="link">
+        <collision name="collision">
+        <geometry><box><size>12 0.2 2.5</size></box></geometry>
+        </collision>
+        <visual name="visual">
+        <geometry><box><size>12 0.2 2.5</size></box></geometry>
+        </visual>
+    </link>
+    </model>
+
+    <model name="room1_right">
+    <static>true</static>
+    <pose>4 5 1.25 0 0 0</pose>
+    <link name="link">
+        <collision name="collision">
+        <geometry><box><size>12 0.2 2.5</size></box></geometry>
+        </collision>
+        <visual name="visual">
+        <geometry><box><size>12 0.2 2.5</size></box></geometry>
+        </visual>
+    </link>
+    </model>
+
+    <!-- LEFT CORRIDOR WALL -->
+    <model name="left_corridor_top">
+    <static>true</static>
+    <pose>-7 5 1.25 0 0 0</pose>
+    <link name="link">
+        <collision name="collision">
+        <geometry><box><size>0.2 6 2.5</size></box></geometry>
+        </collision>
+        <visual name="visual">
+        <geometry><box><size>0.2 6 2.5</size></box></geometry>
+        </visual>
+    </link>
+    </model>
+
+    <model name="left_corridor_bottom">
+    <static>true</static>
+    <pose>-7 -5 1.25 0 0 0</pose>
+    <link name="link">
+        <collision name="collision">
+        <geometry><box><size>0.2 6 2.5</size></box></geometry>
+        </collision>
+        <visual name="visual">
+        <geometry><box><size>0.2 6 2.5</size></box></geometry>
+        </visual>
+    </link>
+    </model>
+
+    <!-- RIGHT CORRIDOR WALL -->
+    <model name="right_corridor_top">
+    <static>true</static>
+    <pose>7 5 1.25 0 0 0</pose>
+    <link name="link">
+        <collision name="collision">
+        <geometry><box><size>0.2 6 2.5</size></box></geometry>
+        </collision>
+        <visual name="visual">
+        <geometry><box><size>0.2 6 2.5</size></box></geometry>
+        </visual>
+    </link>
+    </model>
+
+    <model name="right_corridor_bottom">
+    <static>true</static>
+    <pose>7 -5 1.25 0 0 0</pose>
+    <link name="link">
+        <collision name="collision">
+        <geometry><box><size>0.2 6 2.5</size></box></geometry>
+        </collision>
+        <visual name="visual">
+        <geometry><box><size>0.2 6 2.5</size></box></geometry>
+        </visual>
+    </link>
+    </model>
+
+    <!-- ROOM 4 / ROOM 5 TOP WALL WITH DOOR -->
+    <model name="bottom_left">
+    <static>true</static>
+    <pose>-4 -5 1.25 0 0 0</pose>
+    <link name="link">
+        <collision name="collision">
+        <geometry><box><size>12 0.2 2.5</size></box></geometry>
+        </collision>
+        <visual name="visual">
+        <geometry><box><size>12 0.2 2.5</size></box></geometry>
+        </visual>
+    </link>
+    </model>
+
+    <model name="bottom_right">
+    <static>true</static>
+    <pose>4 -5 1.25 0 0 0</pose>
+    <link name="link">
+        <collision name="collision">
+        <geometry><box><size>12 0.2 2.5</size></box></geometry>
+        </collision>
+        <visual name="visual">
+        <geometry><box><size>12 0.2 2.5</size></box></geometry>
+        </visual>
+    </link>
+    </model>
+
+    <!-- ROOM 2 LEFT WALL -->
+    <model name="room2_separator">
+    <static>true</static>
+    <pose>-10 0 1.25 0 0 0</pose>
+    <link name="link">
+        <collision name="collision">
+        <geometry><box><size>0.2 10 2.5</size></box></geometry>
+        </collision>
+        <visual name="visual">
+        <geometry><box><size>0.2 10 2.5</size></box></geometry>
+        </visual>
+    </link>
+    </model>
+
+    <!-- ROOM 3 RIGHT WALL -->
+    <model name="room3_separator">
+    <static>true</static>
+    <pose>10 0 1.25 0 0 0</pose>
+    <link name="link">
+        <collision name="collision">
+        <geometry><box><size>0.2 10 2.5</size></box></geometry>
+        </collision>
+        <visual name="visual">
+        <geometry><box><size>0.2 10 2.5</size></box></geometry>
+        </visual>
+    </link>
+    </model>
+
+    <!-- OBSTACLE 1 -->
+    <model name="obstacle_1">
+    <static>true</static>
+    <pose>-1 -1 0.5 0 0 0</pose>
+    <link name="link">
+        <collision name="collision">
+        <geometry>
+            <cylinder>
+            <radius>0.3</radius>
+            <length>1.0</length>
+            </cylinder>
+        </geometry>
+        </collision>
+        <visual name="visual">
+        <geometry>
+            <cylinder>
+            <radius>0.3</radius>
+            <length>1.0</length>
+            </cylinder>
+        </geometry>
+        </visual>
+    </link>
+    </model>
+
+    <!-- OBSTACLE 2 -->
+    <model name="obstacle_2">
+    <static>true</static>
+    <pose>2 2 0.5 0 0 0</pose>
+    <link name="link">
+        <collision name="collision">
+        <geometry>
+            <cylinder>
+            <radius>0.3</radius>
+            <length>1.0</length>
+            </cylinder>
+        </geometry>
+        </collision>
+        <visual name="visual">
+        <geometry>
+            <cylinder>
+            <radius>0.3</radius>
+            <length>1.0</length>
+            </cylinder>
+        </geometry>
+        </visual>
+    </link>
+    </model>
+
+    <model name="middle_left">
+    <static>true</static>
+    <pose>-4 0 1.25 0 0 0</pose>
+
+    <link name="link">
+        <collision name="collision">
+        <geometry>
+            <box>
+            <size>6 0.2 2.5</size>
+            </box>
+        </geometry>
+        </collision>
+
+        <visual name="visual">
+        <geometry>
+            <box>
+            <size>6 0.2 2.5</size>
+            </box>
+        </geometry>
+        </visual>
+    </link>
+    </model>
+
+    <model name="middle_right">
+    <static>true</static>
+    <pose>4 0 1.25 0 0 0</pose>
+
+    <link name="link">
+        <collision name="collision">
+        <geometry>
+            <box>
+            <size>6 0.2 2.5</size>
+            </box>
+        </geometry>
+        </collision>
+
+        <visual name="visual">
+        <geometry>
+            <box>
+            <size>6 0.2 2.5</size>
+            </box>
+        </geometry>
+        </visual>
+    </link>
+    </model>
+
+  </world>
+
+</sdf>
