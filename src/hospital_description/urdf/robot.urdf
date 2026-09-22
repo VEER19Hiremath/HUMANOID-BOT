@@ -1,31 +1,50 @@
 <?xml version="1.0"?>
-<robot name="custom_robo">
+<!--
+  Differential-drive hospital bot.
 
-  <!-- WORLD link removed so odom can serve as the dynamic parent TF -->
+  Dimensions (must stay in sync with base_controller):
+    wheel_radius = 0.0762 m
+    wheel_base   = 0.4318 m  (left y=+0.2159, right y=-0.2159)
 
-  <!-- ROBOT REFERENCE FRAME (AXLE / GROUND REFERENCE) -->
+  Nav2 uses robot_base_frame:=base_footprint and robot_radius≈0.22
+  (circle approx of this footprint). Collision boxes below are for
+  RViz / future footprint publishers — Nav2 currently uses the radius.
+-->
+<robot name="hospital_bot">
+
+  <!-- Ground / odom child frame (published by base_controller) -->
   <link name="base_footprint"/>
 
-  <!-- BASE LINK -->
+  <!-- Chassis: raised to wheel axle height -->
   <link name="base_link">
     <visual>
       <!--
         CAD origin is at a corner.
-        X/Y shift centers the mesh.
-        Z shift is raised so the base equator aligns with wheel axle height.
+        X/Y shift centers the mesh; Z centers height on the axle.
       -->
       <origin xyz="-0.293165 -0.26707 -0.0127" rpy="1.57079632679 0 1.57079632679"/>
       <geometry>
         <mesh filename="package://hospital_description/meshes/base.stl"
               scale="0.001 0.001 0.001"/>
       </geometry>
+      <material name="grey">
+        <color rgba="0.6 0.6 0.6 1"/>
+      </material>
     </visual>
+    <!-- Approx chassis for collision / footprint sanity (L x W x H) -->
+    <collision>
+      <origin xyz="0 0 0.05" rpy="0 0 0"/>
+      <geometry>
+        <box size="0.50 0.40 0.20"/>
+      </geometry>
+    </collision>
   </link>
 
   <joint name="base_footprint_to_base_link" type="fixed">
     <parent link="base_footprint"/>
     <child link="base_link"/>
-    <origin xyz="0 0 0" rpy="0 0 0"/>
+    <!-- Axle height = wheel radius -->
+    <origin xyz="0 0 0.0762" rpy="0 0 0"/>
   </joint>
 
   <!-- LEFT WHEEL -->
@@ -37,6 +56,12 @@
               scale="0.001 0.001 0.001"/>
       </geometry>
     </visual>
+    <collision>
+      <origin xyz="0 0 0.0762" rpy="1.5708 0 0"/>
+      <geometry>
+        <cylinder radius="0.0762" length="0.04"/>
+      </geometry>
+    </collision>
   </link>
 
   <joint name="left_wheel_joint" type="continuous">
@@ -49,13 +74,19 @@
   <!-- RIGHT WHEEL -->
   <link name="right_wheel">
     <visual>
-      <!-- use SAME STL as left wheel, only mirrored by rotation -->
+      <!-- Same STL as left, mirrored by rotation -->
       <origin xyz="-0.0762 0 0.0762" rpy="0 1.5708 4.7124"/>
       <geometry>
         <mesh filename="package://hospital_description/meshes/left_wheel.stl"
               scale="0.001 0.001 0.001"/>
       </geometry>
     </visual>
+    <collision>
+      <origin xyz="0 0 0.0762" rpy="1.5708 0 0"/>
+      <geometry>
+        <cylinder radius="0.0762" length="0.04"/>
+      </geometry>
+    </collision>
   </link>
 
   <joint name="right_wheel_joint" type="continuous">
@@ -65,7 +96,7 @@
     <axis xyz="0 -1 0"/>
   </joint>
 
-  <!-- RPLIDAR A2M8 -->
+  <!-- RPLIDAR A2M8 — frame_id must match rplidar launch (laser) -->
   <link name="laser">
     <visual>
       <origin xyz="0 0 0" rpy="0 0 0"/>
@@ -76,11 +107,18 @@
         <color rgba="0 0 0 1"/>
       </material>
     </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="0.035" length="0.04"/>
+      </geometry>
+    </collision>
   </link>
 
   <joint name="base_link_to_laser" type="fixed">
     <parent link="base_link"/>
     <child link="laser"/>
+    <!-- ~15 cm above chassis center → ~22.6 cm above ground -->
     <origin xyz="0 0 0.15" rpy="0 0 0"/>
   </joint>
 

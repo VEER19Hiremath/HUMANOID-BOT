@@ -17,7 +17,7 @@ PID_FILE="$LOG_DIR/pids"
 
 # Demo defaults from Sep 24 lab bringup
 ODOM_SOURCE="command"
-IDLE_CLOSE_S="5.0"
+IDLE_CLOSE_S="15.0"
 STATIC_MAP_ODOM="true"
 
 mkdir -p "$LOG_DIR"

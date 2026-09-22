@@ -36,7 +36,9 @@ const int R_MIN_PWM = 100;
 const int R_MAX_PWM = 170;
 
 // Extra ceiling cut when both wheels drive the same way (straight).
-const int STRAIGHT_MAX_PWM = 140;
+// Dual-forward is the failure mode: turns (opposite F/R) OK, straight
+// one wheel dies — drivers brown out / latch when both pull peak together.
+const int STRAIGHT_MAX_PWM = 120;
 
 // Per-motor speed trim — reduces one motor to match the other
 // Start at 1.0 for both. Lower the faster motor's trim until speeds match.
@@ -44,7 +46,13 @@ const float L_TRIM = 1.0;
 const float R_TRIM = 1.0;
 
 // PWM ramp step per loop iteration (lower = smoother, less jerky)
-const int RAMP_STEP = 3;
+const int RAMP_STEP = 2;
+
+// On straight entry from stop: bring left up first, then right, so both
+// drivers do not hit inrush at the same instant.
+const unsigned long STRAIGHT_STAGGER_MS = 80;
+unsigned long straight_started_at = 0;
+bool was_straight = false;
 
 // Velocity deadband — per-wheel commands below this are treated as zero
 const float VEL_DEADBAND = 0.01;
@@ -100,7 +108,8 @@ void hardStop() {
 }
 
 // Enable both motors (ENBL HIGH = run on this wiring).
-// Fault-clear pulse only on STOP→RUN edge (left driver often latches).
+// Fault-clear pulse only on STOP→RUN edge. Clear left then right so both
+// drivers do not recover and draw inrush in the same microsecond.
 void motorEnable() {
   digitalWrite(L_BRK, LOW);
   digitalWrite(R_BRK, LOW);
@@ -108,11 +117,15 @@ void motorEnable() {
   if (!motors_enabled) {
     digitalWrite(L_ENBL, LOW);
     digitalWrite(R_ENBL, LOW);
-    delayMicroseconds(5000);  // longer latch-clear pulse
+    delayMicroseconds(3000);
+    digitalWrite(L_ENBL, HIGH);
+    delayMicroseconds(4000);  // left lives first
+    digitalWrite(R_ENBL, HIGH);
     motors_enabled = true;
+  } else {
+    digitalWrite(L_ENBL, HIGH);
+    digitalWrite(R_ENBL, HIGH);
   }
-  digitalWrite(L_ENBL, HIGH);
-  digitalWrite(R_ENBL, HIGH);
 }
 
 // ================== ENCODERS (DEBOUNCED) ========
@@ -191,6 +204,8 @@ void driveMotor(float leftVel, float rightVel) {
   // Full hard stop only when BOTH wheels commanded zero
   if (leftStopped && rightStopped) {
     hardStop();
+    was_straight = false;
+    straight_started_at = 0;
     return;
   }
 
@@ -200,11 +215,24 @@ void driveMotor(float leftVel, float rightVel) {
   bool left_wants_fwd  = (leftVel  >= 0);
   bool right_wants_fwd = (rightVel >= 0);
 
-  // Straight = both moving, same sign, similar speed → lower PWM to avoid
-  // one driver brownout (symptom: turns OK, straight only one wheel).
+  // Straight = both moving, same sign, similar speed → lower PWM + stagger
+  // (turns: opposite F/R — both wheels usually spin; straight: dual-forward
+  // brownout / latch is the common failure on this chassis).
   bool going_straight = !leftStopped && !rightStopped
       && (left_wants_fwd == right_wants_fwd)
       && (abs(abs(leftVel) - abs(rightVel)) < 0.04);
+
+  if (going_straight && !was_straight) {
+    straight_started_at = millis();
+  }
+  was_straight = going_straight;
+
+  // Hold right at zero for STRAIGHT_STAGGER_MS after entering straight from
+  // a non-straight or stopped state, so left takes the first current spike.
+  bool stagger_right = going_straight
+      && (straight_started_at != 0)
+      && (millis() - straight_started_at < STRAIGHT_STAGGER_MS);
+
   int l_max = going_straight ? min(L_MAX_PWM, STRAIGHT_MAX_PWM) : L_MAX_PWM;
   int r_max = going_straight ? min(R_MAX_PWM, STRAIGHT_MAX_PWM) : R_MAX_PWM;
 
@@ -213,12 +241,9 @@ void driveMotor(float leftVel, float rightVel) {
     // Direction change requested but motor still spinning — coast to zero first
     pwm_left_actual = rampPWM(pwm_left_actual, 0);
     analogWrite(L_AVI, pwm_left_actual);
-    // Don't switch dir pin yet; return and wait for next loop iteration
   } else {
-    // Safe to set direction and ramp
     if (!leftStopped) {
       left_dir_fwd = left_wants_fwd;
-      // Set direction FIRST
       if (left_dir_fwd)
         digitalWrite(L_FR, LEFT_INVERTED ? LOW : HIGH);
       else
@@ -230,8 +255,11 @@ void driveMotor(float leftVel, float rightVel) {
   }
 
   // --- RIGHT WHEEL ---
-  if (!rightStopped && (right_wants_fwd != right_dir_fwd) && pwm_right_actual > 0) {
-    // Direction change requested but motor still spinning — coast to zero first
+  if (stagger_right) {
+    // Keep right coasting while left soft-starts (straight only).
+    pwm_right_actual = rampPWM(pwm_right_actual, 0);
+    analogWrite(R_AVI, pwm_right_actual);
+  } else if (!rightStopped && (right_wants_fwd != right_dir_fwd) && pwm_right_actual > 0) {
     pwm_right_actual = rampPWM(pwm_right_actual, 0);
     analogWrite(R_AVI, pwm_right_actual);
   } else {

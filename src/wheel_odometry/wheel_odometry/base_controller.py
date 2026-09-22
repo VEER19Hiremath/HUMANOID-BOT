@@ -28,6 +28,7 @@ class BaseController(Node):
             pass
         self.ser = None
         self.ready_at = 0.0
+        self.last_write_ok_at = 0.0
         self.next_attempt = time.monotonic() + self.RETRY_PERIOD
 
     def try_connect(self):
@@ -80,6 +81,7 @@ class BaseController(Node):
         self.last_right = None
         self.target_vl = 0.0
         self.target_vr = 0.0
+        self.last_write_ok_at = 0.0
 
         self.declare_parameter('wheel_base', 0.4318)
         self.declare_parameter('right_encoder_multiplier', 1.0)
@@ -93,12 +95,10 @@ class BaseController(Node):
 
         self.timer = self.create_timer(0.05, self.update_sensors_and_odom)
 
+        # Only the post-smoother topic. Subscribing to cmd_vel_nav as well
+        # double-drives the motors and fights the velocity smoother.
         self.cmd_sub = self.create_subscription(
             Twist, '/cmd_vel', self.cmd_vel_callback, 10)
-        self.cmd_nav_sub = self.create_subscription(
-            Twist, '/cmd_vel_nav', self.cmd_vel_callback, 10)
-        self.cmd_smooth_sub = self.create_subscription(
-            Twist, '/cmd_vel_smoothed', self.cmd_vel_callback, 10)
 
         self.get_logger().info("Base Controller started")
 
@@ -143,8 +143,16 @@ class BaseController(Node):
         command = f"VL:{self.target_vl:.2f} VR:{self.target_vr:.2f}\n"
         try:
             self.ser.write(command.encode())
+            self.last_write_ok_at = time.monotonic()
         except (serial.SerialException, OSError, termios.error) as e:
             self.disconnect_serial(e)
+
+    def drive_confirmed(self):
+        """True only if Mega link is up and a write succeeded recently."""
+        return (
+            self.link_ready()
+            and (time.monotonic() - self.last_write_ok_at) < 0.4
+        )
 
     def destroy_node(self):
         try:
@@ -174,6 +182,7 @@ class BaseController(Node):
                     pass
                 self.ser = None
                 self.booted = False
+                self.last_write_ok_at = 0.0
                 self.get_logger().info("Idle: Arduino port closed")
             return []
 
@@ -281,12 +290,15 @@ class BaseController(Node):
             return
         self.last_time = now
 
+        # Do not integrate fictional motion while the Mega is disconnected or
+        # writes are failing — that made Nav2 "arrive" with a dead wheel.
         moving = abs(self.target_vl) > 0.0 or abs(self.target_vr) > 0.0
-        if not self.link_ready():
-            vl = vr = 0.0
-        else:
-            vl = self.target_vl if moving else 0.0
-            vr = self.target_vr if moving else 0.0
+        if not self.drive_confirmed():
+            self._publish_odom(0.0, 0.0)
+            return
+
+        vl = self.target_vl if moving else 0.0
+        vr = self.target_vr if moving else 0.0
 
         wheel_base = self.get_parameter('wheel_base').value
         v = 0.5 * (vl + vr)

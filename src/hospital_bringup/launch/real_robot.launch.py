@@ -3,6 +3,7 @@ from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration, Command
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 from ament_index_python.packages import get_package_share_directory
 import os
 from launch.actions import TimerAction
@@ -18,6 +19,9 @@ def generate_launch_description():
     rplidar_pkg = get_package_share_directory('rplidar_ros')
 
     robot_urdf = os.path.join(description_pkg, 'urdf', 'robot.urdf')
+    # URDF must be forced to str — otherwise launch tries to parse XML as YAML
+    # and aborts the whole base launch (no TF → robot invisible in RViz).
+    robot_description = ParameterValue(Command(['cat ', robot_urdf]), value_type=str)
 
     return LaunchDescription(
         [
@@ -38,7 +42,7 @@ def generate_launch_description():
             output='screen',
             parameters=[{
                 'use_sim_time': use_sim_time,
-                'robot_description': Command(['cat ', robot_urdf])
+                'robot_description': robot_description,
             }]
         ),
 
