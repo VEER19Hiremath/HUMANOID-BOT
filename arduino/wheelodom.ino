@@ -32,29 +32,30 @@ void encRightIsr() { right_count++; }
 #define RIGHT_INVERTED  true
 
 // ================== SPEED / PWM =================
-// Visible creep on a ~30x40 ft floor without the old fuse-blowing band.
-const float CRUISE_MPS = 0.16;
+// Keep current well under the fuse. Breakaway at 70 with locked
+ // hubs was blowing fuses and thrashing in place.
+const float CRUISE_MPS = 0.12;
 const float VEL_DEADBAND = 0.01;
-const int PWM_START = 52;
-const int PWM_CRUISE = 64;
-const int PWM_MAX = 72;
-const int PWM_STRAIGHT_MAX = 66;
-const int PWM_BREAKAWAY = 70;
-const unsigned long BREAKAWAY_MS = 800;
+const int PWM_START = 46;
+const int PWM_CRUISE = 54;
+const int PWM_MAX = 58;
+const int PWM_STRAIGHT_MAX = 56;
+const int PWM_BREAKAWAY = 56;           // never above cruise+2
+const unsigned long BREAKAWAY_MS = 400;
 
-const float PWM_RAMP_UP_PER_SEC = 18.0;
-const float PWM_RAMP_UP_BREAKAWAY_PER_SEC = 50.0;
+const float PWM_RAMP_UP_PER_SEC = 14.0;
+const float PWM_RAMP_UP_BREAKAWAY_PER_SEC = 22.0;
 const float PWM_RAMP_DOWN_PER_SEC = 40.0;
 const unsigned long IDLE_ENBL_OFF_MS = 1500;
 const unsigned long CMD_TIMEOUT_MS = 500;
 const unsigned long REPORT_MS = 50;
-const unsigned long STALL_CUT_MS = 3000;  // creep/optos tick slowly — 500ms was killing left
-const unsigned long STALL_RETRY_MS = 800;  // re-breakaway sooner
+const unsigned long STALL_CUT_MS = 1200;
+const unsigned long STALL_RETRY_MS = 2500;
 const int STALL_PWM_MIN = 20;
-// Stall-zeroing one side makes the robot pivot in place. Keep both sides
-// driven; only use stall state to force a fresh breakaway kick.
+// On stall: stop BOTH sides (never kick one wheel alone — that spins
+ // in place and spikes current into a blown fuse).
 const bool STALL_DETECT = true;
-const bool STALL_ZERO_PWM = false;
+const bool STALL_ZERO_BOTH = true;
 
 // Opto polarity. Set INVERT_ENBL_BRK true if commons are on GND
 // (Mega HIGH = short/run) instead of the Hetai common-+5V default.
@@ -261,75 +262,60 @@ void driveMotor(float leftVel, float rightVel) {
     pwm_right_actual = rampPWM(pwm_right_actual, 0, dt, false);
   }
 
-  // Stall latch with retry: detect no ticks, but do NOT zero one side
-  // (that pivots forever on the other wheel). Re-breakaway instead.
-  if (!STALL_DETECT) {
-    // skip stall logic
-  } else if (leftStopped) {
-    left_stalled = false;
-    left_stall_since_ms = 0;
-    left_stall_count = l_now;
-  } else if (left_stalled) {
-    if (now_ms - left_stall_since_ms >= STALL_RETRY_MS) {
-      left_stalled = false;
-      left_stall_since_ms = now_ms;
-      left_stall_count = l_now;
-      motion_start_ms = now_ms;  // new breakaway window
-    } else if (STALL_ZERO_PWM) {
-      pwm_left_actual = 0;
-    } else {
-      pwm_left_actual = max(pwm_left_actual, (float)PWM_BREAKAWAY);
-    }
-  } else if (pwm_left_actual >= STALL_PWM_MIN) {
-    if (l_now != left_stall_count) {
-      left_stall_count = l_now;
-      left_stall_since_ms = now_ms;
-    } else if (left_stall_since_ms == 0) {
-      left_stall_since_ms = now_ms;
-    } else if (now_ms - left_stall_since_ms >= STALL_CUT_MS) {
-      left_stalled = true;
-      left_stall_since_ms = now_ms;
-      if (STALL_ZERO_PWM) {
-        pwm_left_actual = 0;
-      } else {
-        pwm_left_actual = max(pwm_left_actual, (float)PWM_BREAKAWAY);
-        motion_start_ms = now_ms;
-      }
-    }
-  }
-
+  // Stall: if either side has no encoder ticks, stop BOTH wheels.
+  // Re-kicking one side at high PWM blew fuses and spun in place.
   if (!STALL_DETECT) {
     // skip
-  } else if (rightStopped) {
-    right_stalled = false;
-    right_stall_since_ms = 0;
-    right_stall_count = r_now;
-  } else if (right_stalled) {
-    if (now_ms - right_stall_since_ms >= STALL_RETRY_MS) {
-      right_stalled = false;
-      right_stall_since_ms = now_ms;
-      right_stall_count = r_now;
-      motion_start_ms = now_ms;
-    } else if (STALL_ZERO_PWM) {
-      pwm_right_actual = 0;
-    } else {
-      pwm_right_actual = max(pwm_right_actual, (float)PWM_BREAKAWAY);
-    }
-  } else if (pwm_right_actual >= STALL_PWM_MIN) {
-    if (r_now != right_stall_count) {
-      right_stall_count = r_now;
-      right_stall_since_ms = now_ms;
-    } else if (right_stall_since_ms == 0) {
-      right_stall_since_ms = now_ms;
-    } else if (now_ms - right_stall_since_ms >= STALL_CUT_MS) {
-      right_stalled = true;
-      right_stall_since_ms = now_ms;
-      if (STALL_ZERO_PWM) {
-        pwm_right_actual = 0;
-      } else {
-        pwm_right_actual = max(pwm_right_actual, (float)PWM_BREAKAWAY);
+  } else {
+    if (leftStopped) {
+      left_stalled = false;
+      left_stall_since_ms = 0;
+      left_stall_count = l_now;
+    } else if (left_stalled) {
+      if (now_ms - left_stall_since_ms >= STALL_RETRY_MS) {
+        left_stalled = false;
+        left_stall_since_ms = now_ms;
+        left_stall_count = l_now;
         motion_start_ms = now_ms;
       }
+    } else if (pwm_left_actual >= STALL_PWM_MIN) {
+      if (l_now != left_stall_count) {
+        left_stall_count = l_now;
+        left_stall_since_ms = now_ms;
+      } else if (left_stall_since_ms == 0) {
+        left_stall_since_ms = now_ms;
+      } else if (now_ms - left_stall_since_ms >= STALL_CUT_MS) {
+        left_stalled = true;
+        left_stall_since_ms = now_ms;
+      }
+    }
+
+    if (rightStopped) {
+      right_stalled = false;
+      right_stall_since_ms = 0;
+      right_stall_count = r_now;
+    } else if (right_stalled) {
+      if (now_ms - right_stall_since_ms >= STALL_RETRY_MS) {
+        right_stalled = false;
+        right_stall_since_ms = now_ms;
+        right_stall_count = r_now;
+        motion_start_ms = now_ms;
+      }
+    } else if (pwm_right_actual >= STALL_PWM_MIN) {
+      if (r_now != right_stall_count) {
+        right_stall_count = r_now;
+        right_stall_since_ms = now_ms;
+      } else if (right_stall_since_ms == 0) {
+        right_stall_since_ms = now_ms;
+      } else if (now_ms - right_stall_since_ms >= STALL_CUT_MS) {
+        right_stalled = true;
+        right_stall_since_ms = now_ms;
+      }
+    }
+
+    if (STALL_ZERO_BOTH && (left_stalled || right_stalled)) {
+      pwm_left_actual = 0;
+      pwm_right_actual = 0;
     }
   }
 

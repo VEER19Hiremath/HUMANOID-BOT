@@ -144,7 +144,7 @@ class BaseController(Node):
         if abs(speed) < 0.008:
             return 0.0
         sign = 1.0 if speed > 0.0 else -1.0
-        return sign * min(0.16, abs(speed))
+        return sign * min(0.12, abs(speed))
 
     def cmd_vel_callback(self, msg):
         linear = msg.linear.x
@@ -168,7 +168,7 @@ class BaseController(Node):
         vr = (v + half * w) * speed_mult
         # Left side is weaker / stalls more often — slight bias.
         if abs(vl) > 0.008:
-            vl = (1.0 if vl > 0.0 else -1.0) * min(0.16, abs(vl) * 1.12)
+            vl = (1.0 if vl > 0.0 else -1.0) * min(0.12, abs(vl) * 1.08)
         vl = self.scale_for_motors(vl)
         vr = self.scale_for_motors(vr)
 
