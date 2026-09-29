@@ -1,3 +1,10 @@
+// Fresh Mega firmware: BLDC-5015A control + wheel encoders.
+// Protocol (unchanged for ROS base_controller):
+//   Host  -> "VL:<mps> VR:<mps>\n"
+//   Mega  -> "SAFE START READY"
+//           "L:<count> R:<count>"
+//           "S: pwmL=.. pwmR=.. enblL=.. enblR=.. brkOff=.. L=.. R=.."
+
 // ================== LEFT MOTOR ==================
 #define L_AVI   9
 #define L_FR    30
@@ -17,314 +24,380 @@
 volatile long left_count  = 0;
 volatile long right_count = 0;
 
+void encLeftIsr()  { left_count++; }
+void encRightIsr() { right_count++; }
+
 // ================== MOTOR ORIENTATION ===========
-// Left forward was dead on straight (both FWD) while reverse worked in turns.
-// Flip left so "forward" uses the F/R state that actually spins.
 #define LEFT_INVERTED   true
 #define RIGHT_INVERTED  true
 
-// ================== SPEED PARAMETERS ============
-// Max wheel velocity (m/s) - absolute top speed this robot will ever run
-const float MAX_VEL = 0.12;
-
-// ── Per-motor PWM ranges ──────────────────────────────────────────────────
-// Keep moderate: both-forward at 200 often browns out one driver.
-const int L_MIN_PWM = 100;
-const int L_MAX_PWM = 170;
-
-const int R_MIN_PWM = 100;
-const int R_MAX_PWM = 170;
-
-// Extra ceiling cut when both wheels drive the same way (straight).
-// Dual-forward is the failure mode: turns (opposite F/R) OK, straight
-// one wheel dies — drivers brown out / latch when both pull peak together.
-const int STRAIGHT_MAX_PWM = 120;
-
-// Per-motor speed trim — reduces one motor to match the other
-// Start at 1.0 for both. Lower the faster motor's trim until speeds match.
-const float L_TRIM = 1.0;
-const float R_TRIM = 1.0;
-
-// PWM ramp step per loop iteration (lower = smoother, less jerky)
-const int RAMP_STEP = 2;
-
-// On straight entry from stop: bring left up first, then right, so both
-// drivers do not hit inrush at the same instant.
-const unsigned long STRAIGHT_STAGGER_MS = 80;
-unsigned long straight_started_at = 0;
-bool was_straight = false;
-
-// Velocity deadband — per-wheel commands below this are treated as zero
+// ================== SPEED / PWM =================
+// Visible creep on a ~30x40 ft floor without the old fuse-blowing band.
+const float CRUISE_MPS = 0.16;
 const float VEL_DEADBAND = 0.01;
+const int PWM_START = 52;
+const int PWM_CRUISE = 64;
+const int PWM_MAX = 72;
+const int PWM_STRAIGHT_MAX = 66;
+const int PWM_BREAKAWAY = 70;
+const unsigned long BREAKAWAY_MS = 800;
 
-// ================== STATE =======================
+const float PWM_RAMP_UP_PER_SEC = 18.0;
+const float PWM_RAMP_UP_BREAKAWAY_PER_SEC = 50.0;
+const float PWM_RAMP_DOWN_PER_SEC = 40.0;
+const unsigned long IDLE_ENBL_OFF_MS = 1500;
+const unsigned long CMD_TIMEOUT_MS = 500;
+const unsigned long REPORT_MS = 50;
+const unsigned long STALL_CUT_MS = 3000;  // creep/optos tick slowly — 500ms was killing left
+const unsigned long STALL_RETRY_MS = 800;  // re-breakaway sooner
+const int STALL_PWM_MIN = 20;
+// Stall-zeroing one side makes the robot pivot in place. Keep both sides
+// driven; only use stall state to force a fresh breakaway kick.
+const bool STALL_DETECT = true;
+const bool STALL_ZERO_PWM = false;
+
+// Opto polarity. Set INVERT_ENBL_BRK true if commons are on GND
+// (Mega HIGH = short/run) instead of the Hetai common-+5V default.
+const bool INVERT_ENBL_BRK = true;
+const bool ENBL_RUN  = INVERT_ENBL_BRK ? HIGH : LOW;
+const bool ENBL_STOP = INVERT_ENBL_BRK ? LOW  : HIGH;
+const bool BRK_ON    = INVERT_ENBL_BRK ? HIGH : LOW;
+const bool BRK_OFF   = INVERT_ENBL_BRK ? LOW  : HIGH;
+
 float vl_target = 0.0;
 float vr_target = 0.0;
-
-int pwm_left_actual  = 0;   // currently applied PWM (for ramp)
-int pwm_right_actual = 0;
-
-// Track last commanded direction for each wheel (true = forward)
-// Used to detect reversal and coast to zero before switching
-bool left_dir_fwd  = true;
+float pwm_left_actual = 0.0;
+float pwm_right_actual = 0.0;
+bool left_dir_fwd = true;
 bool right_dir_fwd = true;
-
-// ================== DEADMAN TIMER ===============
-unsigned long last_cmd_time = 0;
-const unsigned long CMD_TIMEOUT = 600;  // ms — tolerant of occasional slow serial frames
+bool motors_enabled = false;
 bool command_seen = false;
-
-// Encoder report period. Kept low: USB traffic makes the EMI-induced
-// USB dropouts far more frequent.
-const unsigned long ENC_REPORT_MS = 250;
-
-// Non-blocking serial accumulation buffer
+unsigned long last_cmd_ms = 0;
+unsigned long last_ramp_ms = 0;
+unsigned long fully_stopped_since_ms = 0;
+unsigned long motion_start_ms = 0;
+unsigned long left_stall_since_ms = 0;
+unsigned long right_stall_since_ms = 0;
+long left_stall_count = 0;
+long right_stall_count = 0;
+bool left_stalled = false;
+bool right_stalled = false;
 String cmdBuffer = "";
 
-// ================== LOW LEVEL ===================
+void releaseBrake() {
+  digitalWrite(L_BRK, BRK_OFF);
+  digitalWrite(R_BRK, BRK_OFF);
+}
 
-// Fault-clear edge flag for motorEnable()
-bool motors_enabled = false;
-
-// Hard stop — ENBL polarity is inverted on this robot (Sep 24):
-// RViz "drive" used ENBL LOW and wheels LOCKED; parked used ENBL HIGH and
-// wheels CRAWLED opposite. BRK changes did not affect that, so ENBL is flipped.
 void hardStop() {
   analogWrite(L_AVI, 0);
   analogWrite(R_AVI, 0);
-
-  digitalWrite(L_ENBL, LOW);
-  digitalWrite(R_ENBL, LOW);
-
-  digitalWrite(L_BRK, LOW);
-  digitalWrite(R_BRK, LOW);
-
+  releaseBrake();
+  digitalWrite(L_ENBL, ENBL_STOP);
+  digitalWrite(R_ENBL, ENBL_STOP);
   motors_enabled = false;
-
-  pwm_left_actual  = 0;
-  pwm_right_actual = 0;
-  // Do NOT reset left_dir_fwd / right_dir_fwd here;
-  // direction state should persist so next command ramps smoothly.
+  pwm_left_actual = 0.0;
+  pwm_right_actual = 0.0;
 }
 
-// Enable both motors (ENBL HIGH = run on this wiring).
-// Fault-clear pulse only on STOP→RUN edge. Clear left then right so both
-// drivers do not recover and draw inrush in the same microsecond.
-void motorEnable() {
-  digitalWrite(L_BRK, LOW);
-  digitalWrite(R_BRK, LOW);
+void idleEnableOff() {
+  digitalWrite(L_ENBL, ENBL_STOP);
+  digitalWrite(R_ENBL, ENBL_STOP);
+  motors_enabled = false;
+}
 
+void motorEnable() {
+  releaseBrake();
   if (!motors_enabled) {
-    digitalWrite(L_ENBL, LOW);
-    digitalWrite(R_ENBL, LOW);
-    delayMicroseconds(3000);
-    digitalWrite(L_ENBL, HIGH);
-    delayMicroseconds(4000);  // left lives first
-    digitalWrite(R_ENBL, HIGH);
+    // Open then short ENBL (stop→run edge) with left/right stagger.
+    digitalWrite(L_ENBL, ENBL_STOP);
+    digitalWrite(R_ENBL, ENBL_STOP);
+    delayMicroseconds(5000);
+    digitalWrite(L_ENBL, ENBL_RUN);
+    delayMicroseconds(5000);
+    digitalWrite(R_ENBL, ENBL_RUN);
     motors_enabled = true;
   } else {
-    digitalWrite(L_ENBL, HIGH);
-    digitalWrite(R_ENBL, HIGH);
+    digitalWrite(L_ENBL, ENBL_RUN);
+    digitalWrite(R_ENBL, ENBL_RUN);
   }
 }
 
-// ================== ENCODERS (DEBOUNCED) ========
-// Motor switching noise produces short spikes on the encoder lines, often
-// several per millisecond. An integrator sampled every ENC_SAMPLE_US rides
-// through those spikes: the level only flips after it has been mostly HIGH
-// (or mostly LOW) for ENC_INTEG_MAX samples.
-const unsigned long ENC_SAMPLE_US = 50;
-const uint8_t ENC_INTEG_MAX = 10;
-
-bool left_stable = false, right_stable = false;
-uint8_t left_integ = 0, right_integ = 0;
-unsigned long last_enc_sample = 0;
-
-// Returns true on a filtered LOW -> HIGH transition.
-bool pollEncoder(uint8_t pin, bool* stable, uint8_t* integ) {
-  if (digitalRead(pin)) {
-    if (*integ < ENC_INTEG_MAX) (*integ)++;
-  } else {
-    if (*integ > 0) (*integ)--;
-  }
-  if (!*stable && *integ == ENC_INTEG_MAX) {
-    *stable = true;
-    return true;
-  }
-  if (*stable && *integ == 0) {
-    *stable = false;
-  }
-  return false;
+void setLeftDir(bool fwd) {
+  if (fwd) digitalWrite(L_FR, LEFT_INVERTED ? LOW : HIGH);
+  else     digitalWrite(L_FR, LEFT_INVERTED ? HIGH : LOW);
 }
 
-void pollEncoders() {
-  unsigned long now = micros();
-  if (now - last_enc_sample < ENC_SAMPLE_US) return;
-  last_enc_sample = now;
-  if (pollEncoder(ENC_LEFT, &left_stable, &left_integ)) left_count++;
-  if (pollEncoder(ENC_RIGHT, &right_stable, &right_integ)) right_count++;
+void setRightDir(bool fwd) {
+  if (fwd) digitalWrite(R_FR, RIGHT_INVERTED ? LOW : HIGH);
+  else     digitalWrite(R_FR, RIGHT_INVERTED ? HIGH : LOW);
 }
 
-// Maps velocity to PWM in range [minPWM..maxPWM] per motor
-// Each motor has its own ceiling so hardware differences are compensated.
-int velToPWM(float vel, int minPWM, int maxPWM) {
-  if (abs(vel) < VEL_DEADBAND) return 0;
-  float ratio = constrain(abs(vel) / MAX_VEL, 0.0, 1.0);
-  return constrain((int)(minPWM + ratio * (maxPWM - minPWM)), minPWM, maxPWM);
-}
-
-// Set motor direction pin before applying PWM
-void setLeftDir(float vel) {
-  if (vel >= 0)
-    digitalWrite(L_FR, LEFT_INVERTED ? LOW : HIGH);
-  else
-    digitalWrite(L_FR, LEFT_INVERTED ? HIGH : LOW);
-}
-
-void setRightDir(float vel) {
-  if (vel >= 0)
-    digitalWrite(R_FR, RIGHT_INVERTED ? LOW : HIGH);
-  else
-    digitalWrite(R_FR, RIGHT_INVERTED ? HIGH : LOW);
-}
-
-// Smooth ramp: move actual PWM toward target by at most RAMP_STEP
-int rampPWM(int current, int target) {
-  if (current < target) return min(current + RAMP_STEP, target);
-  if (current > target) return max(current - RAMP_STEP, target);
+float rampPWM(float current, float target, float dt, bool breakaway) {
+  float up = breakaway ? PWM_RAMP_UP_BREAKAWAY_PER_SEC : PWM_RAMP_UP_PER_SEC;
+  float rate = (fabs(target) < fabs(current)) ? PWM_RAMP_DOWN_PER_SEC : up;
+  float step = rate * dt;
+  if (current < target) return min(current + step, target);
+  if (current > target) return max(current - step, target);
   return current;
 }
 
+int pwmForSpeed(float vel, int cap) {
+  float cmd = fabs(vel);
+  if (cmd < VEL_DEADBAND || cmd < 0.02) return 0;
+  if (cmd > CRUISE_MPS) cmd = CRUISE_MPS;
+  float pwm = PWM_START + ((cmd - 0.02) / (CRUISE_MPS - 0.02)) *
+              (PWM_CRUISE - PWM_START);
+  return constrain((int)pwm, 0, cap);
+}
+
+void printStatus() {
+  noInterrupts();
+  long l = left_count;
+  long r = right_count;
+  interrupts();
+  Serial.print("S: pwmL=");
+  Serial.print((int)pwm_left_actual);
+  Serial.print(" pwmR=");
+  Serial.print((int)pwm_right_actual);
+  Serial.print(" enblL=");
+  Serial.print(digitalRead(L_ENBL) == ENBL_RUN ? 1 : 0);
+  Serial.print(" enblR=");
+  Serial.print(digitalRead(R_ENBL) == ENBL_RUN ? 1 : 0);
+  Serial.print(" brkOff=");
+  Serial.print((digitalRead(L_BRK) == BRK_OFF &&
+                digitalRead(R_BRK) == BRK_OFF) ? 1 : 0);
+  Serial.print(" L=");
+  Serial.print(l);
+  Serial.print(" R=");
+  Serial.println(r);
+}
+
+void printEncoders() {
+  noInterrupts();
+  long l = left_count;
+  long r = right_count;
+  interrupts();
+  Serial.print("L:");
+  Serial.print(l);
+  Serial.print(" R:");
+  Serial.println(r);
+}
+
 void driveMotor(float leftVel, float rightVel) {
+  bool leftStopped  = fabs(leftVel)  < VEL_DEADBAND;
+  bool rightStopped = fabs(rightVel) < VEL_DEADBAND;
 
-  // Per-wheel deadband check
-  bool leftStopped  = (abs(leftVel)  < VEL_DEADBAND);
-  bool rightStopped = (abs(rightVel) < VEL_DEADBAND);
+  unsigned long now_ms = millis();
+  float dt = (last_ramp_ms == 0) ? 0.02 : (now_ms - last_ramp_ms) / 1000.0;
+  last_ramp_ms = now_ms;
+  if (dt <= 0.0 || dt > 0.2) dt = 0.02;
 
-  // Full hard stop only when BOTH wheels commanded zero
+  noInterrupts();
+  long l_now = left_count;
+  long r_now = right_count;
+  interrupts();
+
   if (leftStopped && rightStopped) {
-    hardStop();
-    was_straight = false;
-    straight_started_at = 0;
+    pwm_left_actual = rampPWM(pwm_left_actual, 0, dt, false);
+    pwm_right_actual = rampPWM(pwm_right_actual, 0, dt, false);
+    analogWrite(L_AVI, (int)pwm_left_actual);
+    analogWrite(R_AVI, (int)pwm_right_actual);
+    left_stall_since_ms = 0;
+    right_stall_since_ms = 0;
+    left_stalled = false;
+    right_stalled = false;
+    motion_start_ms = 0;
+    if (pwm_left_actual < 1.0 && pwm_right_actual < 1.0) {
+      hardStop();
+      if (fully_stopped_since_ms == 0) fully_stopped_since_ms = now_ms;
+      else if (motors_enabled &&
+               (now_ms - fully_stopped_since_ms) >= IDLE_ENBL_OFF_MS) {
+        idleEnableOff();
+      }
+    }
     return;
   }
 
+  fully_stopped_since_ms = 0;
+  if (motion_start_ms == 0) motion_start_ms = now_ms;
+  bool breakaway = (now_ms - motion_start_ms) < BREAKAWAY_MS;
   motorEnable();
 
-  // Detect direction reversal per wheel
-  bool left_wants_fwd  = (leftVel  >= 0);
-  bool right_wants_fwd = (rightVel >= 0);
-
-  // Straight = both moving, same sign, similar speed → lower PWM + stagger
-  // (turns: opposite F/R — both wheels usually spin; straight: dual-forward
-  // brownout / latch is the common failure on this chassis).
-  bool going_straight = !leftStopped && !rightStopped
-      && (left_wants_fwd == right_wants_fwd)
-      && (abs(abs(leftVel) - abs(rightVel)) < 0.04);
-
-  if (going_straight && !was_straight) {
-    straight_started_at = millis();
+  bool left_fwd = leftVel >= 0.0;
+  bool right_fwd = rightVel >= 0.0;
+  bool straight = !leftStopped && !rightStopped &&
+                  (left_fwd == right_fwd) &&
+                  (fabs(fabs(leftVel) - fabs(rightVel)) < 0.15);
+  int l_cap = straight ? min(PWM_MAX, PWM_STRAIGHT_MAX) : PWM_MAX;
+  int r_cap = straight ? min(PWM_MAX, PWM_STRAIGHT_MAX) : PWM_MAX;
+  if (breakaway) {
+    l_cap = max(l_cap, PWM_BREAKAWAY);
+    r_cap = max(r_cap, PWM_BREAKAWAY);
   }
-  was_straight = going_straight;
 
-  // Hold right at zero for STRAIGHT_STAGGER_MS after entering straight from
-  // a non-straight or stopped state, so left takes the first current spike.
-  bool stagger_right = going_straight
-      && (straight_started_at != 0)
-      && (millis() - straight_started_at < STRAIGHT_STAGGER_MS);
-
-  int l_max = going_straight ? min(L_MAX_PWM, STRAIGHT_MAX_PWM) : L_MAX_PWM;
-  int r_max = going_straight ? min(R_MAX_PWM, STRAIGHT_MAX_PWM) : R_MAX_PWM;
-
-  // --- LEFT WHEEL ---
-  if (!leftStopped && (left_wants_fwd != left_dir_fwd) && pwm_left_actual > 0) {
-    // Direction change requested but motor still spinning — coast to zero first
-    pwm_left_actual = rampPWM(pwm_left_actual, 0);
-    analogWrite(L_AVI, pwm_left_actual);
+  // Coast through a direction reverse before flipping F/R.
+  if (!leftStopped && (left_fwd != left_dir_fwd) && pwm_left_actual > 1.0) {
+    pwm_left_actual = rampPWM(pwm_left_actual, 0, dt, false);
+  } else if (!leftStopped) {
+    left_dir_fwd = left_fwd;
+    setLeftDir(left_dir_fwd);
+    int target = pwmForSpeed(leftVel, l_cap);
+    if (breakaway && !left_stalled) target = max(target, PWM_BREAKAWAY);
+    pwm_left_actual = rampPWM(pwm_left_actual, target, dt, breakaway);
   } else {
-    if (!leftStopped) {
-      left_dir_fwd = left_wants_fwd;
-      if (left_dir_fwd)
-        digitalWrite(L_FR, LEFT_INVERTED ? LOW : HIGH);
-      else
-        digitalWrite(L_FR, LEFT_INVERTED ? HIGH : LOW);
-    }
-    int leftTarget = leftStopped ? 0 : (int)(velToPWM(leftVel, L_MIN_PWM, l_max) * L_TRIM);
-    pwm_left_actual = rampPWM(pwm_left_actual, leftTarget);
-    analogWrite(L_AVI, pwm_left_actual);
+    pwm_left_actual = rampPWM(pwm_left_actual, 0, dt, false);
   }
 
-  // --- RIGHT WHEEL ---
-  if (stagger_right) {
-    // Keep right coasting while left soft-starts (straight only).
-    pwm_right_actual = rampPWM(pwm_right_actual, 0);
-    analogWrite(R_AVI, pwm_right_actual);
-  } else if (!rightStopped && (right_wants_fwd != right_dir_fwd) && pwm_right_actual > 0) {
-    pwm_right_actual = rampPWM(pwm_right_actual, 0);
-    analogWrite(R_AVI, pwm_right_actual);
+  if (!rightStopped && (right_fwd != right_dir_fwd) && pwm_right_actual > 1.0) {
+    pwm_right_actual = rampPWM(pwm_right_actual, 0, dt, false);
+  } else if (!rightStopped) {
+    right_dir_fwd = right_fwd;
+    setRightDir(right_dir_fwd);
+    int target = pwmForSpeed(rightVel, r_cap);
+    if (breakaway && !right_stalled) target = max(target, PWM_BREAKAWAY);
+    pwm_right_actual = rampPWM(pwm_right_actual, target, dt, breakaway);
   } else {
-    if (!rightStopped) {
-      right_dir_fwd = right_wants_fwd;
-      if (right_dir_fwd)
-        digitalWrite(R_FR, RIGHT_INVERTED ? LOW : HIGH);
-      else
-        digitalWrite(R_FR, RIGHT_INVERTED ? HIGH : LOW);
-    }
-    int rightTarget = rightStopped ? 0 : (int)(velToPWM(rightVel, R_MIN_PWM, r_max) * R_TRIM);
-    pwm_right_actual = rampPWM(pwm_right_actual, rightTarget);
-    analogWrite(R_AVI, pwm_right_actual);
+    pwm_right_actual = rampPWM(pwm_right_actual, 0, dt, false);
   }
+
+  // Stall latch with retry: detect no ticks, but do NOT zero one side
+  // (that pivots forever on the other wheel). Re-breakaway instead.
+  if (!STALL_DETECT) {
+    // skip stall logic
+  } else if (leftStopped) {
+    left_stalled = false;
+    left_stall_since_ms = 0;
+    left_stall_count = l_now;
+  } else if (left_stalled) {
+    if (now_ms - left_stall_since_ms >= STALL_RETRY_MS) {
+      left_stalled = false;
+      left_stall_since_ms = now_ms;
+      left_stall_count = l_now;
+      motion_start_ms = now_ms;  // new breakaway window
+    } else if (STALL_ZERO_PWM) {
+      pwm_left_actual = 0;
+    } else {
+      pwm_left_actual = max(pwm_left_actual, (float)PWM_BREAKAWAY);
+    }
+  } else if (pwm_left_actual >= STALL_PWM_MIN) {
+    if (l_now != left_stall_count) {
+      left_stall_count = l_now;
+      left_stall_since_ms = now_ms;
+    } else if (left_stall_since_ms == 0) {
+      left_stall_since_ms = now_ms;
+    } else if (now_ms - left_stall_since_ms >= STALL_CUT_MS) {
+      left_stalled = true;
+      left_stall_since_ms = now_ms;
+      if (STALL_ZERO_PWM) {
+        pwm_left_actual = 0;
+      } else {
+        pwm_left_actual = max(pwm_left_actual, (float)PWM_BREAKAWAY);
+        motion_start_ms = now_ms;
+      }
+    }
+  }
+
+  if (!STALL_DETECT) {
+    // skip
+  } else if (rightStopped) {
+    right_stalled = false;
+    right_stall_since_ms = 0;
+    right_stall_count = r_now;
+  } else if (right_stalled) {
+    if (now_ms - right_stall_since_ms >= STALL_RETRY_MS) {
+      right_stalled = false;
+      right_stall_since_ms = now_ms;
+      right_stall_count = r_now;
+      motion_start_ms = now_ms;
+    } else if (STALL_ZERO_PWM) {
+      pwm_right_actual = 0;
+    } else {
+      pwm_right_actual = max(pwm_right_actual, (float)PWM_BREAKAWAY);
+    }
+  } else if (pwm_right_actual >= STALL_PWM_MIN) {
+    if (r_now != right_stall_count) {
+      right_stall_count = r_now;
+      right_stall_since_ms = now_ms;
+    } else if (right_stall_since_ms == 0) {
+      right_stall_since_ms = now_ms;
+    } else if (now_ms - right_stall_since_ms >= STALL_CUT_MS) {
+      right_stalled = true;
+      right_stall_since_ms = now_ms;
+      if (STALL_ZERO_PWM) {
+        pwm_right_actual = 0;
+      } else {
+        pwm_right_actual = max(pwm_right_actual, (float)PWM_BREAKAWAY);
+        motion_start_ms = now_ms;
+      }
+    }
+  }
+
+  analogWrite(L_AVI, (int)pwm_left_actual);
+  analogWrite(R_AVI, (int)pwm_right_actual);
 }
 
-// ================== PARSE COMMAND ===============
 void parseCommand(const String& cmd) {
+  if (cmd == "TEST") {
+    // Gentle bench kick only — never the old 160 duty that blows fuses.
+    const int kick = PWM_CRUISE;
+    Serial.println("TEST START");
+    motorEnable();
+    setLeftDir(true);
+    setRightDir(true);
+    analogWrite(L_AVI, kick);
+    analogWrite(R_AVI, kick);
+    pwm_left_actual = kick;
+    pwm_right_actual = kick;
+    unsigned long t0 = millis();
+    while (millis() - t0 < 1500) {
+      printEncoders();
+      printStatus();
+      delay(200);
+    }
+    hardStop();
+    Serial.println("TEST DONE");
+    printEncoders();
+    printStatus();
+    return;
+  }
+
   int vlIdx = cmd.indexOf("VL:");
   int vrIdx = cmd.indexOf("VR:");
-
   if (vlIdx >= 0 && vrIdx >= 0) {
     vl_target = cmd.substring(vlIdx + 3, vrIdx).toFloat();
     vr_target = cmd.substring(vrIdx + 3).toFloat();
-    last_cmd_time = millis();
+    last_cmd_ms = millis();
     command_seen = true;
   }
 }
 
-// ================== SETUP =======================
 void setup() {
   Serial.begin(115200);
 
-  pinMode(L_AVI,  OUTPUT);
-  pinMode(R_AVI,  OUTPUT);
-  pinMode(L_FR,   OUTPUT);
-  pinMode(R_FR,   OUTPUT);
+  pinMode(L_AVI, OUTPUT);
+  pinMode(R_AVI, OUTPUT);
+  pinMode(L_FR, OUTPUT);
+  pinMode(R_FR, OUTPUT);
   pinMode(L_ENBL, OUTPUT);
   pinMode(R_ENBL, OUTPUT);
-  pinMode(L_BRK,  OUTPUT);
-  pinMode(R_BRK,  OUTPUT);
+  pinMode(L_BRK, OUTPUT);
+  pinMode(R_BRK, OUTPUT);
 
-  pinMode(ENC_LEFT,  INPUT_PULLUP);
+  pinMode(ENC_LEFT, INPUT_PULLUP);
   pinMode(ENC_RIGHT, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(ENC_LEFT), encLeftIsr, RISING);
+  attachInterrupt(digitalPinToInterrupt(ENC_RIGHT), encRightIsr, RISING);
 
-  left_stable = digitalRead(ENC_LEFT);
-  right_stable = digitalRead(ENC_RIGHT);
-  left_integ = left_stable ? ENC_INTEG_MAX : 0;
-  right_integ = right_stable ? ENC_INTEG_MAX : 0;
-
-  // Always start in hard stop
   hardStop();
-  last_cmd_time = millis();
+  last_cmd_ms = millis();
   command_seen = false;
 
   Serial.println("SAFE START READY");
+  printStatus();
 }
 
-// ================== LOOP ========================
 void loop() {
-  pollEncoders();
-
-  // 1. NON-BLOCKING SERIAL READ
-  // Accumulate characters until '\n', then parse.
-  // This NEVER blocks — so driveMotor() is always called every loop.
   while (Serial.available()) {
     char c = (char)Serial.read();
     if (c == '\n') {
@@ -332,28 +405,27 @@ void loop() {
         parseCommand(cmdBuffer);
         cmdBuffer = "";
       }
-    } else if (c != '\r') {   // ignore carriage return
+    } else if (c != '\r') {
       cmdBuffer += c;
-      if (cmdBuffer.length() > 64) cmdBuffer = "";  // guard against buffer overflow
+      if (cmdBuffer.length() > 64) cmdBuffer = "";
     }
   }
 
-  // 2. DEADMAN TIMEOUT — zero velocity if no command received recently
-  if (!command_seen || millis() - last_cmd_time > CMD_TIMEOUT) {
+  if (!command_seen || (millis() - last_cmd_ms) > CMD_TIMEOUT_MS) {
     vl_target = 0.0;
     vr_target = 0.0;
   }
 
-  // 3. DRIVE MOTORS
   driveMotor(vl_target, vr_target);
 
-  // 4. SEND ENCODER DATA every ENC_REPORT_MS
-  static unsigned long last_enc_time = 0;
-  if (millis() - last_enc_time > ENC_REPORT_MS) {
-    last_enc_time = millis();
-    Serial.print("L:");
-    Serial.print(left_count);
-    Serial.print(" R:");
-    Serial.println(right_count);
+  static unsigned long last_report = 0;
+  if (millis() - last_report >= REPORT_MS) {
+    last_report = millis();
+    printEncoders();
+    if (command_seen &&
+        (fabs(vl_target) > VEL_DEADBAND || fabs(vr_target) > VEL_DEADBAND ||
+         pwm_left_actual > 1.0 || pwm_right_actual > 1.0 || motors_enabled)) {
+      printStatus();
+    }
   }
 }

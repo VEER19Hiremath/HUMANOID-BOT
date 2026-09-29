@@ -21,7 +21,7 @@ def generate_launch_description():
         DeclareLaunchArgument(
             "map",
             default_value=os.path.join(
-                os.path.expanduser("~/Desktop/veeresh/hospital_robot_ws"),
+                os.path.expanduser("~/Desktop/veeresh"),
                 "maps",
                 "hospital_map.yaml"
             ),
@@ -59,6 +59,7 @@ def generate_launch_description():
                 {
                     "use_sim_time": False,
                     "autostart": True,
+                    "bond_timeout": 45.0,
                     "node_names": [
                         "map_server"
                         # "amcl"

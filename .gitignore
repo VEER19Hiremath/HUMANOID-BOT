@@ -24,4 +24,5 @@ Thumbs.db
 
 # Swap files
 *.swp
-*.swo
+*.swo.tools/
+rviz_gl_fix/

@@ -45,7 +45,7 @@ Visualization Manager:
         Y: 0
         Z: 0
       Plane: XY
-      Plane Cell Count: 10
+      Plane Cell Count: 30
       Reference Frame: <Fixed Frame>
       Value: true
     - Alpha: 0.699999988079071
@@ -78,8 +78,8 @@ Visualization Manager:
       Axis: Z
       Channel Name: intensity
       Class: rviz_default_plugins/LaserScan
-      Color: 255; 255; 255
-      Color Transformer: ""
+      Color: 255; 60; 0
+      Color Transformer: FlatColor
       Decay Time: 0
       Enabled: true
       Invert Rainbow: false
@@ -90,8 +90,8 @@ Visualization Manager:
       Name: LaserScan
       Position Transformer: ""
       Selectable: true
-      Size (Pixels): 3
-      Size (m): 0.009999999776482582
+      Size (Pixels): 6
+      Size (m): 0.029999999329447746
       Style: Flat Squares
       Topic:
         Depth: 5
@@ -101,7 +101,7 @@ Visualization Manager:
         Reliability Policy: Reliable
         Value: /scan
       Use Fixed Frame: true
-      Use rainbow: true
+      Use rainbow: false
       Value: true
     - Class: rviz_default_plugins/TF
       Enabled: true
@@ -239,15 +239,15 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz_default_plugins/Orbit
-      Distance: 17.907154083251953
+      Distance: 2.5
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1
         Swap Stereo Eyes: false
         Value: false
       Focal Point:
-        X: 0
-        Y: 0
+        X: 2.2
+        Y: 1.6
         Z: 0
       Focal Shape Fixed Size: true
       Focal Shape Size: 0.05000000074505806

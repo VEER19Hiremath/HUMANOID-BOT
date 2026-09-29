@@ -1,12 +1,9 @@
-# Navigation bringup without docking_server.
-# stock nav2_bringup Jazzy includes opennav_docking; on this robot the docking
-# node fails its lifecycle bond and aborts the whole Nav2 bringup, so voice
-# goals get accepted then immediately ABORTED.
 import os
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, GroupAction, SetEnvironmentVariable
+from launch.conditions import IfCondition, UnlessCondition
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node, SetParameter
 from launch_ros.descriptions import ParameterFile
@@ -22,8 +19,12 @@ def generate_launch_description():
     params_file = LaunchConfiguration('params_file')
     use_respawn = LaunchConfiguration('use_respawn')
     log_level = LaunchConfiguration('log_level')
+    enable_collision_monitor = LaunchConfiguration('enable_collision_monitor')
 
-    # Same as nav2_bringup, minus docking_server
+    # collision_monitor must come up before bt_navigator. Lifecycle manager
+    # sometimes stalls on the bt_navigator bond and never activates later nodes;
+    # without CM active, cmd_vel_smoothed never reaches /cmd_vel and the base
+    # sits still while Nav2 looks "busy".
     lifecycle_nodes = [
         'controller_server',
         'smoother_server',
@@ -34,6 +35,11 @@ def generate_launch_description():
         'collision_monitor',
         'bt_navigator',
         'waypoint_follower',
+    ]
+
+    lifecycle_nodes_with_collision = lifecycle_nodes
+    lifecycle_nodes_without_collision = [
+        n for n in lifecycle_nodes if n != 'collision_monitor'
     ]
 
     remappings = [('/tf', 'tf'), ('/tf_static', 'tf_static')]
@@ -52,14 +58,18 @@ def generate_launch_description():
         SetEnvironmentVariable('RCUTILS_LOGGING_BUFFERED_STREAM', '1'),
         DeclareLaunchArgument('namespace', default_value=''),
         DeclareLaunchArgument('use_sim_time', default_value='false'),
+        DeclareLaunchArgument('autostart', default_value='true'),
         DeclareLaunchArgument(
             'params_file',
             default_value=os.path.join(bringup_dir, 'config', 'nav2_params.yaml'),
         ),
-        DeclareLaunchArgument('autostart', default_value='true'),
         DeclareLaunchArgument('use_respawn', default_value='False'),
         DeclareLaunchArgument('log_level', default_value='info'),
-
+        DeclareLaunchArgument(
+            'enable_collision_monitor',
+            default_value='true',
+            description='false for RViz dry-run when the lidar USB is unplugged',
+        ),
         GroupAction([
             SetParameter('use_sim_time', use_sim_time),
             Node(
@@ -77,8 +87,6 @@ def generate_launch_description():
                 executable='smoother_server',
                 name='smoother_server',
                 output='screen',
-                respawn=use_respawn,
-                respawn_delay=2.0,
                 parameters=[configured_params],
                 arguments=['--ros-args', '--log-level', log_level],
                 remappings=remappings,
@@ -88,8 +96,6 @@ def generate_launch_description():
                 executable='planner_server',
                 name='planner_server',
                 output='screen',
-                respawn=use_respawn,
-                respawn_delay=2.0,
                 parameters=[configured_params],
                 arguments=['--ros-args', '--log-level', log_level],
                 remappings=remappings,
@@ -99,8 +105,6 @@ def generate_launch_description():
                 executable='route_server',
                 name='route_server',
                 output='screen',
-                respawn=use_respawn,
-                respawn_delay=2.0,
                 parameters=[configured_params],
                 arguments=['--ros-args', '--log-level', log_level],
                 remappings=remappings,
@@ -110,8 +114,6 @@ def generate_launch_description():
                 executable='behavior_server',
                 name='behavior_server',
                 output='screen',
-                respawn=use_respawn,
-                respawn_delay=2.0,
                 parameters=[configured_params],
                 arguments=['--ros-args', '--log-level', log_level],
                 remappings=remappings + [('cmd_vel', 'cmd_vel_nav')],
@@ -121,8 +123,6 @@ def generate_launch_description():
                 executable='bt_navigator',
                 name='bt_navigator',
                 output='screen',
-                respawn=use_respawn,
-                respawn_delay=2.0,
                 parameters=[configured_params],
                 arguments=['--ros-args', '--log-level', log_level],
                 remappings=remappings,
@@ -132,8 +132,6 @@ def generate_launch_description():
                 executable='waypoint_follower',
                 name='waypoint_follower',
                 output='screen',
-                respawn=use_respawn,
-                respawn_delay=2.0,
                 parameters=[configured_params],
                 arguments=['--ros-args', '--log-level', log_level],
                 remappings=remappings,
@@ -143,24 +141,28 @@ def generate_launch_description():
                 executable='velocity_smoother',
                 name='velocity_smoother',
                 output='screen',
-                respawn=use_respawn,
-                respawn_delay=2.0,
                 parameters=[configured_params],
                 arguments=['--ros-args', '--log-level', log_level],
-                # Input from controller; smoothed output becomes /cmd_vel
-                # so base_controller has a single drive topic.
-                remappings=remappings + [
-                    ('cmd_vel', 'cmd_vel_nav'),
-                    ('cmd_vel_smoothed', 'cmd_vel'),
-                ],
+                remappings=remappings +
+                [('cmd_vel', 'cmd_vel_nav'), ('cmd_vel_smoothed', 'cmd_vel')],
+                condition=UnlessCondition(enable_collision_monitor),
             ),
             Node(
+                package='nav2_velocity_smoother',
+                executable='velocity_smoother',
+                name='velocity_smoother',
+                output='screen',
+                parameters=[configured_params],
+                arguments=['--ros-args', '--log-level', log_level],
+                remappings=remappings + [('cmd_vel', 'cmd_vel_nav')],
+                condition=IfCondition(enable_collision_monitor),
+            ),
+            Node(
+                condition=IfCondition(enable_collision_monitor),
                 package='nav2_collision_monitor',
                 executable='collision_monitor',
                 name='collision_monitor',
                 output='screen',
-                respawn=use_respawn,
-                respawn_delay=2.0,
                 parameters=[configured_params],
                 arguments=['--ros-args', '--log-level', log_level],
                 remappings=remappings,
@@ -171,10 +173,25 @@ def generate_launch_description():
                 name='lifecycle_manager_navigation',
                 output='screen',
                 arguments=['--ros-args', '--log-level', log_level],
-                parameters=[
-                    {'autostart': autostart},
-                    {'node_names': lifecycle_nodes},
-                ],
+                parameters=[{
+                    'autostart': autostart,
+                    'bond_timeout': 45.0,
+                    'node_names': lifecycle_nodes_with_collision,
+                }],
+                condition=IfCondition(enable_collision_monitor),
+            ),
+            Node(
+                package='nav2_lifecycle_manager',
+                executable='lifecycle_manager',
+                name='lifecycle_manager_navigation',
+                output='screen',
+                arguments=['--ros-args', '--log-level', log_level],
+                parameters=[{
+                    'autostart': autostart,
+                    'bond_timeout': 45.0,
+                    'node_names': lifecycle_nodes_without_collision,
+                }],
+                condition=UnlessCondition(enable_collision_monitor),
             ),
         ]),
     ])
