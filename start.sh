@@ -232,7 +232,7 @@ case "${1:-start}" in
 
     echo "Hospital stack starting. Logs: ${LOG_DIR}"
     echo "Demo: both SW2 OFF, knobs CCW. If a driver shows RED, battery OFF 10s then ON."
-    echo "Ready: say 'go to room one' (one to five), 'go home' or 'stop'."
+    echo "Ready: say 'go to room one' (rooms of the map: see docs/room_map.png), 'go home' or 'stop'."
     echo "Stop with: ./start.sh stop"
     ;;
   map)

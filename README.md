@@ -4,6 +4,8 @@ ROS 2 **Jazzy** workspace for a differential-drive hospital delivery robot: voic
 
 Repository: [VEER19Hiremath/HUMANOID-BOT](https://github.com/VEER19Hiremath/HUMANOID-BOT)
 
+> **New here? Read [docs/HANDOVER.md](docs/HANDOVER.md)**: wiring with cable colours, setup (`./setup.sh`), running, calibration, every file explained, troubleshooting. Map of the rooms: [docs/room_map.png](docs/room_map.png).
+
 ---
 
 ## Hardware

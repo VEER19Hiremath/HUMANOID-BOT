@@ -1,0 +1,22 @@
+# Python packages for the hospital delivery robot (installed by ./setup.sh).
+#
+# ROS 2 Jazzy and its Python bindings (rclpy, tf2_ros, nav2 messages) come
+# from apt, not pip: see setup.sh. Packages below go into ~/venv, which
+# start.sh puts on PYTHONPATH for the voice node.
+
+# Speech recognition (voice_delivery_node.py); model: vosk-model-small-en-us-0.15
+vosk==0.3.45
+# Microphone fallback when neither a Bluetooth headset nor PipeWire capture
+# works (voice_delivery_node.py)
+sounddevice==0.5.6
+
+# Used by scripts and nodes (also available from apt: python3-serial,
+# python3-numpy, python3-scipy, python3-matplotlib)
+pyserial>=3.5          # base_controller.py, bench scripts: talk to the Mega
+numpy>=1.26            # voice level maths, lidar scripts
+scipy>=1.11            # floor_calibrate.py / direction_check.py scan matching
+matplotlib>=3.6        # scripts/render_map.py (docs picture)
+
+# Optional: spoken replies through Google TTS (needs internet and a speaker;
+# without it the robot only logs "Going to room ..." / "Arrived")
+# gTTS>=2.5

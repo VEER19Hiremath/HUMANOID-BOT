@@ -14,7 +14,6 @@ setup(
     license='Apache-2.0',
     entry_points={
         'console_scripts': [
-            'delivery_node = hospital_delivery.delivery_node:main',
             'voice_delivery_node = hospital_delivery.voice_delivery_node:main',
             'room_markers = hospital_delivery.room_markers:main',
         ],
