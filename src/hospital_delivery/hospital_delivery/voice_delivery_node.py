@@ -1,13 +1,20 @@
+import collections
+import fcntl
 import json
+import math
 import os
 import queue
 import re
 import shutil
 import socket
+import struct
 import subprocess
 import tempfile
+import termios
 import threading
 import time
+
+import numpy as np
 
 try:
     from gtts import gTTS
@@ -29,10 +36,34 @@ import rclpy
 from rclpy.node import Node
 from rclpy.action import ActionClient
 from action_msgs.msg import GoalStatus
+from action_msgs.srv import CancelGoal
 from nav2_msgs.action import NavigateToPose
 from geometry_msgs.msg import PoseStamped, Twist
+from std_msgs.msg import String
 
-from hospital_delivery.room_config import ROOM_ALIASES, ROOM_COORDS
+from tf2_ros import Buffer, TransformListener
+
+from hospital_delivery.room_config import (
+    ROOM_ALIASES, ROOM_COORDS, goal_yaw, rooms_from_map)
+
+
+# 16 kHz mono int16 = 32000 bytes/s; more than this unread = over 1 s behind.
+MAX_AUDIO_LAG_BYTES = 32000
+PREROLL_BYTES = 16000     # 0.5 s of 16 kHz audio before speech starts
+HANGOVER_S = 0.8          # keep listening this long after the voice drops
+HFP_SOCK = "/tmp/hospital_hfp_mic.sock"
+# Exists only while scripts/hfp_mic.py has headset audio flowing.
+HFP_LINK_FLAG = "/tmp/hospital_hfp_mic.up"
+
+
+def headset_linked():
+    """True while the headset bridge (its pid is in the flag) streams audio."""
+    try:
+        with open(HFP_LINK_FLAG) as f:
+            os.kill(int(f.read().strip()), 0)   # a stale flag from a killed bridge
+    except (OSError, ValueError):
+        return False
+    return os.path.exists(HFP_SOCK)
 
 
 class VoiceDeliveryNode(Node):
@@ -68,6 +99,15 @@ class VoiceDeliveryNode(Node):
             "navigate_to_pose",
         )
         self.cmd_vel_pub = self.create_publisher(Twist, "/cmd_vel", 10)
+        # Cancel ALL navigate_to_pose goals (an empty request = every goal).
+        # Cancelling through the goal handle failed whenever the "accepted"
+        # reply was lost on DDS: no handle, so "stop" left Nav2 driving.
+        self.cancel_all_client = self.create_client(
+            CancelGoal, "navigate_to_pose/_action/cancel_goal")
+        # Typed commands go through the same path as speech, e.g.
+        #   ros2 topic pub --once /voice_command std_msgs/String "data: go to room one"
+        self.create_subscription(
+            String, "voice_command", lambda msg: self.command_queue.put(msg.data), 10)
         self.active_goal = None
         self._goal_lock = threading.Lock()
         self._pending_room = None
@@ -78,6 +118,7 @@ class VoiceDeliveryNode(Node):
         self._listening = False
         self._capture_source_id = None
         self._mute_mic = False
+        self._dropped_audio_s = 0.0
         self._shutdown = False
         self._partial_text = ""
         self._quiet_since = None
@@ -85,10 +126,34 @@ class VoiceDeliveryNode(Node):
         self._last_live_at = 0.0
 
         self._noise_floor = 280.0
+        self._preroll = collections.deque()
+        self._in_speech = False
+        self._last_speech = 0.0
         self._stable_partial = ""
         self._stable_since = 0.0
 
-        self.rooms = ROOM_COORDS
+        # Stop when the mic is flat this long during a goal (0 = off). Off by
+        # default: in a quiet room a live headset reads rms 1-3 / peak 3-5,
+        # the same as a dead link, so it stopped every trip after 8 s quiet.
+        self.declare_parameter("mic_watchdog_s", 0.0)
+        # Lowest word confidence (0-1) a room command needs.
+        self.declare_parameter("min_confidence", 0.5)
+        self._mic_alive_rms = 6.0
+        self._mic_alive_at = time.monotonic()
+        self._mic_lost = False
+        self.create_timer(1.0, self._mic_watchdog)
+
+        # Rooms come from the map start.sh loaded ("# room:" lines), so each
+        # map carries its own; room_config.ROOM_COORDS is the fallback.
+        self.declare_parameter("map_yaml", "")
+        map_yaml = self.get_parameter("map_yaml").value
+        self.rooms = rooms_from_map(map_yaml) if map_yaml else None
+        if self.rooms:
+            self.get_logger().info(f"Rooms from {map_yaml}: {self.rooms}")
+        else:
+            self.rooms = ROOM_COORDS
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
 
         self.status_names = {
             GoalStatus.STATUS_UNKNOWN: "UNKNOWN",
@@ -173,17 +238,12 @@ class VoiceDeliveryNode(Node):
             self._mute_mic = False
 
     def _chunk_rms(self, data):
-        if len(data) < 2:
+        # numpy: the per-sample Python loop cost a big share of a core and
+        # helped push recognition ~20 s behind while driving.
+        samples = np.frombuffer(data[:len(data) - len(data) % 2], dtype="<i2")
+        if samples.size == 0:
             return 0.0
-        total = 0
-        count = 0
-        for i in range(0, len(data) - 1, 2):
-            sample = int.from_bytes(data[i:i + 2], "little", signed=True)
-            total += sample * sample
-            count += 1
-        if count == 0:
-            return 0.0
-        return (total / count) ** 0.5
+        return float(np.sqrt(np.mean(samples.astype(np.float32) ** 2)))
 
     def _pipewire_capture_cmd(self):
         if shutil.which("arecord"):
@@ -352,9 +412,18 @@ class VoiceDeliveryNode(Node):
         """Limit recognition to room commands so headset audio is not free-dictated."""
         recognizer = KaldiRecognizer(self.model, sample_rate)
         phrases = ["[unk]", "stop", "go home", "reception"]
-        for aliases in ROOM_ALIASES.values():
-            phrases.extend(aliases)
+        # Only the rooms of the loaded map: fewer words, fewer mix-ups.
+        for room, aliases in ROOM_ALIASES.items():
+            if room not in self.rooms:
+                continue
+            # Vosk's vocabulary has no digits ("room 1", "room1"): it drops the
+            # unknown word, leaving a bare "room". Spoken forms cover them.
+            phrases.extend(
+                a for a in aliases
+                if not any(ch.isdigit() for ch in a) and a not in phrases
+            )
         recognizer.SetGrammar(json.dumps(phrases))
+        recognizer.SetWords(True)   # per-word confidence in final results
         return recognizer
 
     def _start_continuous_listen(self):
@@ -397,11 +466,36 @@ class VoiceDeliveryNode(Node):
             return True
         return self.extract_room(text) is not None
 
-    def _queue_command(self, text):
-        """Queue one navigation phrase. The same text is ignored for 3 s."""
+    @staticmethod
+    def _is_stop(text):
+        return text in ("stop", "stop robot")
+
+    @staticmethod
+    def _confidence(result):
+        """Lowest word confidence of a final Vosk result, or None."""
+        words = result.get("result") or []
+        confs = [w.get("conf", 0.0) for w in words if w.get("word") != "[unk]"]
+        return min(confs) if confs else None
+
+    def _queue_command(self, text, conf=None, final=True):
+        """Queue one command. The same text is ignored for 3 s.
+
+        "stop" is taken from anything, even a partial guess (a false stop is
+        harmless). A room command needs a finished phrase whose every word
+        the recognizer is sure of: partial guesses and unsure words sent the
+        robot off on background talk.
+        """
         text = (text or "").lower().strip()
         if not self._accept_phrase(text):
             return False
+        if not self._is_stop(text):
+            min_conf = float(self.get_parameter("min_confidence").value)
+            if not final:
+                return False
+            if conf is not None and conf < min_conf:
+                self.get_logger().warning(
+                    f"Ignoring unsure phrase '{text}' (confidence {conf:.2f} < {min_conf})")
+                return False
         now = time.monotonic()
         if text == self._last_live_cmd and now - self._last_live_at < 3.0:
             return False
@@ -427,16 +521,9 @@ class VoiceDeliveryNode(Node):
             self._stable_partial = text
             self._stable_since = time.monotonic()
             return recognizer
-        words = text.split()
-        if words == ["home"]:
-            hold = 0.9
-        elif len(words) >= 3:
-            hold = 0.2
-        else:
-            hold = 0.65
-        if time.monotonic() - self._stable_since < hold:
-            return recognizer
-        if self._queue_command(text):
+        # Only "stop" acts on a partial guess (at once). Room commands wait
+        # for the finished phrase and its confidence (_on_recognized_text).
+        if self._is_stop(text) and self._queue_command(text, final=False):
             return self._new_recognizer(sample_rate)
         return recognizer
 
@@ -446,51 +533,99 @@ class VoiceDeliveryNode(Node):
         self._partial_text = ""
         self._quiet_since = None
         self._stable_partial = ""
-        self._queue_command(text)
+        self._queue_command(text, conf=self._confidence(result))
 
     def _finish_partial(self, recognizer, sample_rate):
         """Vosk ends a phrase only after quiet audio. The mic gate used to drop
         that quiet audio, so 'go to room one' stayed a partial and never drove."""
-        text = ""
+        text, conf, final = "", None, True
         try:
             result = json.loads(recognizer.FinalResult() or "{}")
             text = (result.get("text") or "").lower().strip()
+            conf = self._confidence(result)
         except Exception:
             text = ""
         if not text:
-            text = (self._partial_text or "").lower().strip()
+            # No finished phrase: the last partial may still stop the robot,
+            # but never send it anywhere.
+            text, final = (self._partial_text or "").lower().strip(), False
         self._partial_text = ""
         self._quiet_since = None
         self._stable_partial = ""
         recognizer = self._new_recognizer(sample_rate)
-        self._queue_command(text)
+        self._queue_command(text, conf=conf, final=final)
         return recognizer
 
+    def _mic_watchdog(self):
+        limit = float(self.get_parameter("mic_watchdog_s").value)
+        if limit <= 0.0 or self.model is None:
+            return
+        silent_for = time.monotonic() - self._mic_alive_at
+        if silent_for < limit:
+            if self._mic_lost:
+                self._mic_lost = False
+                self.get_logger().info("Microphone back")
+            return
+        if self._mic_lost or not (self._nav_busy or self.active_goal is not None):
+            return
+        self._mic_lost = True
+        self.get_logger().error(
+            f"Microphone silent for {silent_for:.0f} s while driving; stopping "
+            "(cannot hear stop)."
+        )
+        self.stop_robot(announce=False)
+        self.speak("Microphone lost, stopping")
+
     def _consume_audio(self, recognizer, data, sample_rate):
-        """Feed the recognizer only while the mic is above the room floor."""
+        """Feed the recognizer whole phrases, gated by the mic level.
+
+        Only audio above the room floor is speech, but a phrase's soft start
+        and the quiet gaps between its words sit below it: with a noisy USB
+        mic "go home" reached the recognizer as just "home" (floor test
+        2026-09-30). So the last PREROLL_S of audio is fed when speech starts,
+        and audio keeps flowing HANGOVER_S after it drops.
+        """
         rms = self._chunk_rms(data)
-        if self._mute_mic or not self._is_speech(rms):
-            if self._mute_mic:
-                self._partial_text = ""
-                self._quiet_since = None
-                self._stable_partial = ""
-                return self._new_recognizer(sample_rate)
+        if rms > self._mic_alive_rms:
+            self._mic_alive_at = time.monotonic()
+        if self._mute_mic:
+            self._partial_text = ""
+            self._quiet_since = None
+            self._stable_partial = ""
+            self._preroll.clear()
+            self._in_speech = False
+            return self._new_recognizer(sample_rate)
+        now = time.monotonic()
+        if self._is_speech(rms):
+            self._last_speech = now
+            if not self._in_speech:
+                self._in_speech = True
+                for chunk in self._preroll:
+                    recognizer = self._feed(recognizer, chunk, sample_rate)
+                self._preroll.clear()
+            return self._feed(recognizer, data, sample_rate)
+        if self._in_speech and now - self._last_speech < HANGOVER_S:
+            return self._feed(recognizer, data, sample_rate)
+        if self._in_speech:
+            self._in_speech = False
             if self._partial_text:
-                if self._quiet_since is None:
-                    self._quiet_since = time.monotonic()
-                elif time.monotonic() - self._quiet_since >= 0.5:
-                    recognizer = self._finish_partial(recognizer, sample_rate)
-            return recognizer
-        self._quiet_since = None
+                recognizer = self._finish_partial(recognizer, sample_rate)
+        self._preroll.append(data)
+        while sum(len(c) for c in self._preroll) > PREROLL_BYTES:
+            self._preroll.popleft()
+        return recognizer
+
+    def _feed(self, recognizer, data, sample_rate):
         if recognizer.AcceptWaveform(data):
             self._on_recognized_text(recognizer)
-        else:
-            partial = json.loads(recognizer.PartialResult() or "{}")
-            heard = (partial.get("partial") or "").strip()
-            if heard:
-                self._partial_text = heard
-                self.get_logger().info(f"Hearing: {heard}")
-                recognizer = self._consider_live(heard, recognizer, sample_rate)
+            return recognizer
+        partial = json.loads(recognizer.PartialResult() or "{}")
+        heard = (partial.get("partial") or "").strip()
+        if heard and heard != self._partial_text:
+            self._partial_text = heard
+            self.get_logger().info(f"Hearing: {heard}")
+        if heard:
+            recognizer = self._consider_live(heard, recognizer, sample_rate)
         return recognizer
 
     def _listen_pipewire(self):
@@ -503,12 +638,10 @@ class VoiceDeliveryNode(Node):
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
-        if source_id:
-            self.get_logger().info(
-                f"Listening continuously from microphone {source_id}"
-            )
-        else:
-            self.get_logger().warning("No microphone is connected.")
+        if not source_id:
+            proc.terminate()
+            raise RuntimeError("no system microphone")
+        self.get_logger().info(f"Listening from system microphone {source_id}")
         chunks = 0
         loudest = 0.0
         try:
@@ -517,6 +650,9 @@ class VoiceDeliveryNode(Node):
                 if not data:
                     err = proc.stderr.read().decode("utf-8", "replace").strip()
                     raise RuntimeError(err or "microphone capture stopped")
+                if headset_linked():
+                    self.get_logger().info("Headset connected: switching to it")
+                    return
                 rms = self._chunk_rms(data)
                 loudest = max(loudest, rms)
                 chunks += 1
@@ -540,31 +676,68 @@ class VoiceDeliveryNode(Node):
             except subprocess.TimeoutExpired:
                 proc.kill()
 
+    @staticmethod
+    def _socket_pending(sock):
+        """Bytes waiting in the socket (unread audio)."""
+        try:
+            return struct.unpack("i", fcntl.ioctl(sock.fileno(), termios.FIONREAD, b"\0\0\0\0"))[0]
+        except OSError:
+            return 0
+
     def _listen_hfp(self):
         """Read the call-link PCM published by scripts/hfp_mic.py."""
         sample_rate = 16000
         recognizer = self._new_recognizer(sample_rate)
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         sock.settimeout(2.0)
-        sock.connect("/tmp/hospital_hfp_mic.sock")
-        self.get_logger().info("Listening continuously from the headset call link")
+        sock.connect(HFP_SOCK)
+        self.get_logger().info("Listening from the Bluetooth headset")
         loudest = 0.0
         last_report = time.monotonic()
         try:
+            gone_since = None
             while self._listening and rclpy.ok() and not self._shutdown:
+                # Gone for 2 s = disconnected (not a single missed check).
+                if headset_linked():
+                    gone_since = None
+                elif gone_since is None:
+                    gone_since = time.monotonic()
+                elif time.monotonic() - gone_since > 2.0:
+                    self.get_logger().warning("Headset disconnected")
+                    return
                 try:
                     data = sock.recv(4000)
                 except socket.timeout:
                     continue
                 if not data:
                     raise RuntimeError("headset call link closed")
+                # Never fall more than ~1 s behind: on a loaded Pi the backlog
+                # grew to ~20 s and "stop" was heard far too late (floor test
+                # 2026-09-30). Drop the old audio and listen to what's live.
+                pending = self._socket_pending(sock)
+                if pending > MAX_AUDIO_LAG_BYTES:
+                    dropped = 0
+                    while self._socket_pending(sock) > 8000:
+                        chunk = sock.recv(32000)
+                        if not chunk:
+                            break
+                        dropped += len(chunk)
+                    self._dropped_audio_s += dropped / 32000.0
+                    recognizer = self._new_recognizer(sample_rate)
+                    self._partial_text = ""
+                    self._stable_partial = ""
+                    self._quiet_since = None
+                    continue
                 rms = self._chunk_rms(data)
                 loudest = max(loudest, rms)
                 now = time.monotonic()
                 if now - last_report >= 2.0:
                     self.get_logger().info(
                         f"Mic level rms={rms:.0f} peak_rms={loudest:.0f}"
+                        + (f" (behind: dropped {self._dropped_audio_s:.1f} s)"
+                           if self._dropped_audio_s else "")
                     )
+                    self._dropped_audio_s = 0.0
                     loudest = 0.0
                     last_report = now
                 recognizer = self._consume_audio(recognizer, data, sample_rate)
@@ -572,90 +745,29 @@ class VoiceDeliveryNode(Node):
             sock.close()
 
     def _listen_loop(self):
-        # Prefer the headset call-link when present; fall back to PipeWire / sounddevice.
-        # A leftover /tmp/hospital_hfp_mic.sock with no server must not block forever.
-        hfp_failures = 0
-        hfp_wait = 0
-        while self._listening and not self._shutdown and rclpy.ok() and hfp_wait < 8:
-            if os.path.exists("/tmp/hospital_hfp_mic.sock"):
-                try:
+        """Listen on whichever microphone works, switching as devices come and go.
+
+        A Bluetooth headset (scripts/hfp_mic.py, any paired hands-free
+        headset) wins while its audio flows; otherwise the system default
+        microphone (USB or wired) through PipeWire.
+        """
+        last_warning = 0.0
+        while self._listening and not self._shutdown and rclpy.ok():
+            try:
+                if headset_linked():
                     self._listen_hfp()
-                    hfp_failures = 0
                     continue
-                except Exception as exc:
-                    hfp_failures += 1
-                    self.get_logger().warning(
-                        f"Headset call link failed ({exc}); "
-                        f"retry {hfp_failures}/3"
-                    )
-                    if not self._listening or self._shutdown:
-                        return
-                    if hfp_failures >= 3:
-                        try:
-                            os.unlink("/tmp/hospital_hfp_mic.sock")
-                        except OSError:
-                            pass
-                        self.get_logger().warning(
-                            "Dropping stale headset socket; falling back to system mic"
-                        )
-                        break
-                    time.sleep(1.0)
-                    continue
-            hfp_wait += 1
-            time.sleep(1.0)
-
-        if self._pipewire_capture_cmd() is not None:
-            while self._listening and not self._shutdown and rclpy.ok():
-                try:
+                if self._pipewire_capture_cmd() is not None:
                     self._listen_pipewire()
-                    return
-                except Exception as exc:
+                    continue
+            except Exception as exc:
+                if time.monotonic() - last_warning > 30:
                     self.get_logger().warning(
-                        f"PipeWire microphone failed ({exc}); retrying"
+                        f"No microphone yet ({exc}): connect a Bluetooth headset "
+                        "or plug in a USB microphone"
                     )
-                    if not self._listening or self._shutdown:
-                        return
-                    time.sleep(1.0)
-
-        if sd is None:
-            self.get_logger().error("No microphone capture backend available")
-            self._listening = False
-            return
-
-        sample_rate = 16000
-        audio_q = queue.Queue()
-
-        def callback(indata, frames, time_info, status):
-            audio_q.put(bytes(indata))
-
-        recognizer = self._new_recognizer(sample_rate)
-        try:
-            with sd.RawInputStream(
-                samplerate=sample_rate,
-                blocksize=4000,
-                dtype="int16",
-                channels=1,
-                callback=callback,
-            ):
-                self.get_logger().info("Listening continuously...")
-                while self._listening and rclpy.ok() and not self._shutdown:
-                    try:
-                        data = audio_q.get(timeout=0.25)
-                    except queue.Empty:
-                        continue
-                    if self._mute_mic and audio_q.qsize() > 20:
-                        try:
-                            while True:
-                                audio_q.get_nowait()
-                        except queue.Empty:
-                            pass
-                    recognizer = self._consume_audio(
-                        recognizer, data, sample_rate
-                    )
-        except Exception as exc:
-            self.get_logger().error(f"Microphone listen loop failed: {exc}")
-        finally:
-            self._listening = False
+                    last_warning = time.monotonic()
+            time.sleep(1.0)
 
     def stop_robot(self, announce=True):
         stop_msg = Twist()
@@ -664,11 +776,13 @@ class VoiceDeliveryNode(Node):
             self.active_goal = None
             self._pending_room = None
             self._nav_busy = False
+        self.cancel_all_client.call_async(CancelGoal.Request())
         if goal is not None:
             try:
                 goal.cancel_goal_async()
             except Exception as e:
                 self.get_logger().warning(f"Could not cancel active goal: {e}")
+        self.get_logger().info("Stop: all navigation goals cancelled")
         for _ in range(20):
             self.cmd_vel_pub.publish(stop_msg)
             time.sleep(0.05)
@@ -739,7 +853,8 @@ class VoiceDeliveryNode(Node):
             "room 1", "room 2", "room 3", "room 4", "room 5",
         )
         stripped = t.strip()
-        if stripped in ("home", "reception", "one", "two", "three", "four", "five"):
+        # Bare numbers (and a bare "home") are not commands: noise produces them.
+        if stripped == "reception":
             return True
         return any(phrase in t for phrase in navigation_phrases)
 
@@ -788,12 +903,24 @@ class VoiceDeliveryNode(Node):
         goal_msg.pose.pose.position.x = x
         goal_msg.pose.pose.position.y = y
         goal_msg.pose.pose.position.z = 0.0
-        goal_msg.pose.pose.orientation.w = 1.0
+        # Arrive driving straight in; the turn-around happens on departure,
+        # in the open space around the room.
+        yaw = goal_yaw(self._robot_xy(), (x, y))
+        goal_msg.pose.pose.orientation.z = math.sin(yaw / 2.0)
+        goal_msg.pose.pose.orientation.w = math.cos(yaw / 2.0)
 
         send_future = self.nav_client.send_goal_async(goal_msg)
         send_future.add_done_callback(
             lambda fut, room=room_name: self._on_goal_response(fut, room)
         )
+
+    def _robot_xy(self):
+        """Robot position on the map; home if TF isn't available yet."""
+        try:
+            t = self.tf_buffer.lookup_transform("map", "base_footprint", rclpy.time.Time())
+            return t.transform.translation.x, t.transform.translation.y
+        except Exception:
+            return self.rooms.get("home", (0.0, 0.0))
 
     def _on_goal_response(self, future, room_name):
         try:
@@ -918,8 +1045,21 @@ class VoiceDeliveryNode(Node):
             return
 
         room = self.extract_room(command)
-        if room is not None:
+        if room is not None and "[unk]" in command:
+            # Part of the phrase was noise or other talk ("[unk] gotta toronto"
+            # redirected the robot on the floor, 2026-09-30). Only clean
+            # phrases may send or redirect it; "stop" is handled above.
+            self.get_logger().warning(f"Ignoring unclear phrase '{command}'")
+            return
+        if room is not None and self.is_navigation_command(command):
             self.navigate_to_room(room)
+            return
+        if room is not None:
+            # Bare "one", "the one", "a one", "two": Vosk makes these out of
+            # background talk and motor noise. They sent the robot off six
+            # times in ten minutes on the bench (2026-09-30).
+            self.get_logger().warning(
+                f"Ignoring short phrase '{command}': say 'room one' or 'go to room one'")
             return
 
         if not self.is_navigation_command(command):
@@ -949,7 +1089,8 @@ class VoiceDeliveryNode(Node):
                 self.speak("An error occurred.")
 
         self._listening = False
-        self.stop_robot(announce=False)
+        if rclpy.ok():
+            self.stop_robot(announce=False)
 
 
 def main(args=None):
@@ -959,7 +1100,9 @@ def main(args=None):
         node.run()
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        # start.sh stop sends SIGINT, which already shut the context down.
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == "__main__":

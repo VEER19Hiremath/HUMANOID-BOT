@@ -1,37 +1,156 @@
 #!/usr/bin/env python3
-"""Base controller: Arduino wheel drive + odometry (encoder or command)."""
+"""Base controller: /cmd_vel -> Mega wheel speeds, Mega pulses -> /odom + TF.
+
+The Mega (arduino/wheelodom.ino) closes the speed loop on each wheel, so a
+commanded wheel speed is the real one whatever the drag. This node:
+
+  * turns /cmd_vel into left/right wheel speeds for an arcs-only base (no
+    turning on the spot, wheels never in opposite directions) and eases them
+    in (acceleration limit);
+  * sends them as "VL:<m/s> VR:<m/s>" at 50 Hz while moving (the Mega stops
+    by itself 300 ms after the last command);
+  * sends the calibrated metres-per-pulse of each wheel ("K:<l> <r>") at
+    every (re)connect, from config/odometry.yaml;
+  * integrates the Mega's signed pulse counts into /odom and odom->base_footprint.
+    The pose comes from measured wheel motion only: no extrapolation between
+    reports, no command-based guessing.
+"""
 
 import math
 import time
 import termios
 
-import serial
 import rclpy
-from rclpy.node import Node
-from geometry_msgs.msg import Twist, Quaternion, TransformStamped
+import serial
+from geometry_msgs.msg import Quaternion, TransformStamped, Twist
 from nav_msgs.msg import Odometry
+from rclpy.executors import ExternalShutdownException
+from rclpy.node import Node
 from sensor_msgs.msg import JointState
 from tf2_ros import TransformBroadcaster
-from rclpy.executors import ExternalShutdownException
 
-from wheel_odometry.motion_limits import MIN_TRAVEL_M, inside_map, wheel_travel
+MAX_WHEEL_MPS = 0.15     # cruise (real m/s since the floor calibration)
+WHEEL_DEADBAND = 0.008   # m/s; below = wheel stopped
+# Tightest arc: radius ~0.46 m, the inner wheel at ~36 % of the outer one.
+# Tighter scrubs the tyres and stalls a hub; wider left no room to turn
+# round in a 20 x 20 ft area (the planner uses 0.50 m).
+MAX_TURN_RATE_PER_SPEED = 0.47   # w <= v / (wheel_base / 2) * this
+MIN_ARC_SPEED = 0.08     # pure rotation becomes a forward arc at this speed
+ACCEL = 0.10             # m/s^2 per wheel, speeding up
+DECEL = 0.30             # m/s^2 per wheel, slowing down
+CMD_TIMEOUT = 0.5        # s without /cmd_vel -> stop
+BOOT_TIME = 1.8          # s after opening the port (the Mega may reset)
+RETRY_PERIOD = 0.5       # s between reconnect attempts
+STATUS_LOG_PERIOD = 1.0  # s between logged Mega status lines
+MAX_PULSES_PER_REPORT = 60   # 50 ms reports; more = corrupt line
+
+
+def wheel_speeds(v, w, wheel_base):
+    """(left, right) wheel speeds in m/s for body speed v and turn rate w."""
+    half = wheel_base / 2.0
+    if abs(w) > 0.015 and abs(v) < MIN_ARC_SPEED:
+        v = math.copysign(MIN_ARC_SPEED, v if v != 0.0 else 1.0)
+    if abs(v) >= 0.02:
+        w_max = abs(v) / half * MAX_TURN_RATE_PER_SPEED
+        w = max(-w_max, min(w_max, w))
+    left, right = v - half * w, v + half * w
+    # Keep the ratio when limiting the faster wheel to cruise.
+    peak = max(abs(left), abs(right))
+    if peak > MAX_WHEEL_MPS:
+        left, right = left * MAX_WHEEL_MPS / peak, right * MAX_WHEEL_MPS / peak
+    if abs(left) < WHEEL_DEADBAND:
+        left = 0.0
+    if abs(right) < WHEEL_DEADBAND:
+        right = 0.0
+    if left * right < 0.0:            # never opposite directions
+        left = right = left if abs(left) >= abs(right) else right
+    return left, right
+
+
+def ease(current, target, dt):
+    """Move a wheel speed toward target within the accel/decel limits."""
+    limit = (DECEL if abs(target) < abs(current) or target * current < 0 else ACCEL) * dt
+    return current + max(-limit, min(limit, target - current))
+
+
+def integrate(x, y, theta, dl, dr, wheel_base):
+    """Pose after the wheels moved dl, dr metres (exact for an arc)."""
+    ds = 0.5 * (dl + dr)
+    dth = (dr - dl) / wheel_base
+    if abs(dth) < 1e-6:
+        return x + ds * math.cos(theta), y + ds * math.sin(theta), theta
+    r = ds / dth
+    return (x + r * (math.sin(theta + dth) - math.sin(theta)),
+            y - r * (math.cos(theta + dth) - math.cos(theta)),
+            theta + dth)
 
 
 class BaseController(Node):
-    BOOT_TIME = 1.8
-    RETRY_PERIOD = 0.3
+    def __init__(self):
+        super().__init__('base_controller')
+        self.declare_parameter('arduino_port', '/dev/arduino')
+        self.declare_parameter('wheel_base', 0.4318)
+        # Metres per speed pulse of the left wheel, and right/left pulse
+        # length. From config/odometry.yaml (scripts/floor_calibrate.py).
+        self.declare_parameter('distance_per_pulse', 0.0025)
+        self.declare_parameter('right_encoder_multiplier', 1.0)
+        self.wheel_base = self.get_parameter('wheel_base').value
+        self.k_left = self.get_parameter('distance_per_pulse').value
+        self.k_right = self.k_left * self.get_parameter('right_encoder_multiplier').value
 
-    def disconnect_serial(self, reason):
-        self.get_logger().warn(f'Arduino link lost ({reason}); reconnecting')
-        self.close_arduino(self.ser)
+        self.odom_pub = self.create_publisher(Odometry, '/odom', 10)
+        self.joint_pub = self.create_publisher(JointState, '/joint_states', 10)
+        self.tf_broadcaster = TransformBroadcaster(self)
+        self.create_subscription(Twist, '/cmd_vel', self._on_cmd_vel, 10)
+
         self.ser = None
+        self.booted = False
         self.ready_at = 0.0
-        self.last_write_ok_at = 0.0
-        self.next_attempt = time.monotonic() + self.RETRY_PERIOD
+        self.next_attempt = 0.0
+        self.rx_buf = b''
 
-    def open_arduino(self):
-        """Open the Mega without the DTR pulse that holds it in reset."""
-        port = self.get_parameter('arduino_port').value
+        self.target = [0.0, 0.0]      # commanded wheel speeds (m/s)
+        self.wheel = [0.0, 0.0]       # eased wheel speeds sent to the Mega
+        self.last_cmd = 0.0
+        self.last_tick = time.monotonic()
+
+        self.x = self.y = self.theta = 0.0
+        self.counts = None            # last (left, right) signed counts
+        self.v_meas = self.w_meas = 0.0
+        self.last_report = None
+        self.wheel_angle = [0.0, 0.0]
+        self.wheel_radius = 0.0762
+        self._last_status_log = 0.0
+
+        self.create_timer(0.02, self._tick)
+        self.get_logger().info(
+            f'Base controller: {self.k_left * 1000:.3f} / {self.k_right * 1000:.3f} '
+            'mm per pulse (left / right)')
+
+    # ---------------- commands ----------------
+    def _on_cmd_vel(self, msg):
+        self.target = list(wheel_speeds(msg.linear.x, msg.angular.z, self.wheel_base))
+        self.last_cmd = time.monotonic()
+
+    def _tick(self):
+        now = time.monotonic()
+        dt = min(max(now - self.last_tick, 0.0), 0.1)
+        self.last_tick = now
+        if now - self.last_cmd > CMD_TIMEOUT:
+            self.target = [0.0, 0.0]
+        for i in (0, 1):
+            self.wheel[i] = ease(self.wheel[i], self.target[i], dt)
+            if abs(self.wheel[i]) < 0.002 and self.target[i] == 0.0:
+                self.wheel[i] = 0.0
+
+        self._service_link()
+        if self.booted and (any(self.wheel) or now - self.last_cmd < CMD_TIMEOUT):
+            self._send(f'VL:{self.wheel[0]:.3f} VR:{self.wheel[1]:.3f}')
+        self._publish_joints(dt)
+
+    # ---------------- serial link ----------------
+    def _open(self, port):
+        """Open the Mega without the DTR pulse that resets it."""
         link = serial.Serial()
         link.port = port
         link.baudrate = 115200
@@ -39,613 +158,130 @@ class BaseController(Node):
         link.write_timeout = 0.1
         link.dtr = False
         link.rts = False
-        try:
-            link.open()
-            return link
-        except (serial.SerialException, OSError, termios.error):
-            try:
-                link.close()
-            except (serial.SerialException, OSError, termios.error):
-                pass
-            return serial.Serial(port, 115200, timeout=0, write_timeout=0.1)
+        link.open()
+        return link
 
-    def close_arduino(self, link):
-        """Stop the wheels, then close without the USB reset (HUPCL) pulse."""
-        if link is None:
+    def _close(self):
+        if self.ser is None:
             return
         try:
-            if link.is_open:
-                link.write(b'VL:0.00 VR:0.00\n')
-                link.flush()
-                time.sleep(0.05)
-                attr = termios.tcgetattr(link.fd)
-                attr[2] = attr[2] & ~termios.HUPCL
-                termios.tcsetattr(link.fd, termios.TCSANOW, attr)
-                link.dtr = False
-                link.close()
+            if self.ser.is_open:
+                self.ser.write(b'VL:0.000 VR:0.000\n')
+                self.ser.flush()
+                attr = termios.tcgetattr(self.ser.fd)
+                attr[2] &= ~termios.HUPCL      # no reset pulse on close
+                termios.tcsetattr(self.ser.fd, termios.TCSANOW, attr)
+            self.ser.close()
         except (serial.SerialException, OSError, termios.error):
-            try:
-                link.close()
-            except (serial.SerialException, OSError, termios.error):
-                pass
+            pass
+        self.ser = None
+        self.booted = False
 
-    def try_connect(self):
+    def _lost(self, reason):
+        self.get_logger().warn(f'Mega link lost ({reason}); reconnecting')
+        self._close()
+        self.counts = None
+        self.next_attempt = time.monotonic() + RETRY_PERIOD
+
+    def _send(self, line):
+        try:
+            self.ser.write((line + '\n').encode())
+        except (serial.SerialException, OSError, termios.error) as e:
+            self._lost(e)
+
+    def _service_link(self):
         now = time.monotonic()
-        if now < self.next_attempt:
-            return
-        self.next_attempt = now + self.RETRY_PERIOD
-        try:
-            self.ser = self.open_arduino()
-            self.ready_at = now + self.BOOT_TIME
-            self.last_left = None
-            self.last_right = None
+        if self.ser is None:
+            if now < self.next_attempt:
+                return
+            self.next_attempt = now + RETRY_PERIOD
+            try:
+                self.ser = self._open(self.get_parameter('arduino_port').value)
+            except (serial.SerialException, OSError, termios.error):
+                self.ser = None
+                return
+            self.ready_at = now + BOOT_TIME
             self.rx_buf = b''
             self.booted = False
-            self.get_logger().info('Arduino port opened, waiting for boot')
-        except (serial.SerialException, OSError, termios.error):
-            self.ser = None
-
-    def __init__(self):
-        super().__init__('base_controller')
-
-        self.ser = None
-        self.ready_at = 0.0
-        self.next_attempt = 0.0
-        self.rx_buf = b''
-        self.booted = False
-        self.last_cmd_time = time.monotonic()
-        self.last_motion_time = time.monotonic()
-
-        self.declare_parameter('arduino_port', '/dev/arduino')
-        self.declare_parameter('max_pulses_per_sample', 250)
-        self.declare_parameter('odom_source', 'encoder')
-        self.declare_parameter('open_loop_odom', False)
-        self.declare_parameter('idle_close_s', 0.0)
-
-        self.odom_pub = self.create_publisher(Odometry, '/odom', 10)
-        self.joint_pub = self.create_publisher(JointState, '/joint_states', 10)
-        self.tf_broadcaster = TransformBroadcaster(self)
-
-        self.x = 0.0
-        self.y = 0.0
-        self.theta = 0.0
-        self.last_left = None
-        self.last_right = None
-        self.target_vl = 0.0
-        self.target_vr = 0.0
-        self.slewed_vl = 0.0
-        self.slewed_vr = 0.0
-        self.v_filt = 0.0
-        self.w_filt = 0.0
-        self.last_enc_mono = 0.0
-        self._pose_from_enc_at = 0.0
-        self.last_write_ok_at = 0.0
-        self._enc_dead_since = None
-        self._enc_dead_logged = False
-
-        self.declare_parameter('wheel_base', 0.4318)
-        self.declare_parameter('right_encoder_multiplier', 1.0)
-        self.declare_parameter('distance_per_pulse', 0.00531)
-        self.declare_parameter('motor_speed_multiplier', 1.0)
-
-        self.left_wheel_angle = 0.0
-        self.right_wheel_angle = 0.0
-        self.wheel_radius = 0.0762
-        self.last_time = time.time()
-
-        # 50 Hz keeps RViz / TF live with the wheels.
-        self.timer = self.create_timer(0.02, self.update_sensors_and_odom)
-        self.cmd_sub = self.create_subscription(
-            Twist, '/cmd_vel', self.cmd_vel_callback, 10)
-
-        self.get_logger().info('Base Controller started')
-
-    def scale_for_motors(self, speed):
-        if abs(speed) < 0.008:
-            return 0.0
-        sign = 1.0 if speed > 0.0 else -1.0
-        return sign * min(0.12, abs(speed))
-
-    def cmd_vel_callback(self, msg):
-        linear = msg.linear.x
-        angular = msg.angular.z
-        v = linear
-        w = angular
-        wheel_base = self.get_parameter('wheel_base').value
-        speed_mult = self.get_parameter('motor_speed_multiplier').value
-        half = wheel_base / 2.0
-
-        # Avoid opposite-sign wheel cmds (in-place pivot). Mega stall logic
-        # then zeros the slow side and the robot spins on one spot.
-        if abs(w) > 0.02 and abs(v) < 0.09:
-            v = 0.10 if v >= 0.0 else -0.10
-        if abs(v) >= 0.02 and half > 1e-6:
-            w_max = abs(v) / half * 0.85
-            if abs(w) > w_max:
-                w = w_max if w >= 0.0 else -w_max
-
-        vl = (v - half * w) * speed_mult
-        vr = (v + half * w) * speed_mult
-        # Left side is weaker / stalls more often — slight bias.
-        if abs(vl) > 0.008:
-            vl = (1.0 if vl > 0.0 else -1.0) * min(0.12, abs(vl) * 1.08)
-        vl = self.scale_for_motors(vl)
-        vr = self.scale_for_motors(vr)
-
-        self.target_vl = vl
-        self.target_vr = vr
-        now = time.monotonic()
-        self.last_cmd_time = now
-        if (abs(v) > 0.008 or abs(w) > 0.02 or abs(vl) > 0.0 or abs(vr) > 0.0):
-            self.last_motion_time = now
-
-    def slew_wheels(self, dt):
-        """Ease wheel speed so a new command does not step the pose."""
-        accel = 0.06
-        for current_name, target in (
-            ('slewed_vl', self.target_vl),
-            ('slewed_vr', self.target_vr),
-        ):
-            current = getattr(self, current_name)
-            delta = target - current
-            limit = (0.2 if abs(target) < abs(current) else accel) * dt
-            if delta > limit:
-                delta = limit
-            elif delta < -limit:
-                delta = -limit
-            updated = current + delta
-            if abs(target - updated) < 0.001:
-                updated = target
-            setattr(self, current_name, updated)
-
-    def link_ready(self):
-        if self.ser is None or not self.ser.is_open:
-            return False
-        if time.monotonic() < self.ready_at:
-            return False
-        return self.booted
-
-    def send_target(self):
-        if not self.link_ready():
+            self.counts = None
+            self.get_logger().info('Mega port opened, waiting for it')
             return
-        command = f'VL:{self.slewed_vl:.2f} VR:{self.slewed_vr:.2f}\n'
+        if now < self.ready_at:
+            return
         try:
-            self.ser.write(command.encode())
-            self.last_write_ok_at = time.monotonic()
+            self.rx_buf += self.ser.read(self.ser.in_waiting or 0)
         except (serial.SerialException, OSError, termios.error) as e:
-            self.disconnect_serial(e)
+            self._lost(e)
+            return
+        if len(self.rx_buf) > 8192:
+            self.rx_buf = self.rx_buf[-1024:]
+        *lines, self.rx_buf = self.rx_buf.split(b'\n')
+        for raw in lines:
+            self._handle(raw.decode('utf-8', errors='ignore').strip())
 
-    def drive_confirmed(self):
-        """True only if Mega link is up and a write succeeded recently."""
-        return self.link_ready() and (
-            time.monotonic() - self.last_write_ok_at < 0.4)
-
-    def destroy_node(self):
-        try:
-            self.close_arduino(self.ser)
-        except (serial.SerialException, OSError, termios.error) as e:
-            self.get_logger().error(f'Failed to send shutdown stop: {e}')
-        super().destroy_node()
-
-    def wants_link(self):
-        idle_close = self.get_parameter('idle_close_s').value
-        return idle_close <= 0 or (
-            time.monotonic() - self.last_motion_time < idle_close)
-
-    def read_lines(self):
-        if not self.wants_link():
-            if self.ser is not None:
-                self.close_arduino(self.ser)
-                self.ser = None
-                self.booted = False
-                self.last_write_ok_at = 0.0
-                self.get_logger().info('Idle: Arduino port closed')
-            return []
-
-        if self.ser is None:
-            self.try_connect()
-            return []
-
+    def _handle(self, line):
         if not self.booted:
-            if time.monotonic() < self.ready_at:
-                return []
-            try:
-                data = self.ser.read(self.ser.in_waiting or 0)
-            except (serial.SerialException, OSError, termios.error):
-                return []
-            if b'SAFE START READY' in data or b'L:' in data:
-                if b'\n' in data:
-                    data = data.split(b'\n', 1)[1]
+            if line.startswith('SAFE START READY') or line.startswith('L:'):
                 self.booted = True
-                self.get_logger().info('Arduino ready')
-                if time.monotonic() - self.last_cmd_time < 0.5:
-                    self.send_target()
-                self.rx_buf += data
-            else:
-                self.rx_buf += data
-                if len(self.rx_buf) > 4096:
-                    self.rx_buf = b''
-                return []
-
-        try:
-            chunk = self.ser.read(self.ser.in_waiting or 0)
-            self.rx_buf += chunk
-            if len(self.rx_buf) > 4096:
-                self.rx_buf = b''
-                return []
-            parts = self.rx_buf.split(b'\n')
-            self.rx_buf = parts[-1]
-            return [
-                p.decode('utf-8', errors='ignore').strip()
-                for p in parts[:-1]
-            ]
-        except (serial.SerialException, OSError, termios.error) as e:
-            self.disconnect_serial(e)
-            return []
-
-    def update_sensors_and_odom(self):
-        now = time.monotonic()
-        dt = now - getattr(self, 'last_slew_mono', now)
-        self.last_slew_mono = now
-        if dt <= 0.0 or dt > 0.5:
-            dt = 0.05
-
-        if now - self.last_cmd_time > 0.5:
-            self.target_vl = 0.0
-            self.target_vr = 0.0
-
-        self.slew_wheels(dt)
-        self._spin_wheel_joints(dt)
-        self._publish_wheel_joints()
-
-        if (now - self.last_cmd_time < 0.5
-                or abs(self.slewed_vl) > 0.001
-                or abs(self.slewed_vr) > 0.001):
-            self.send_target()
-
-        odom_source = self.get_parameter('odom_source').value
-        lines = self.read_lines()
-        self._log_arduino_status(lines)
-
-        if odom_source == 'command':
-            self.command_odom(lines)
-            return
-
-        self._absorb_encoders(lines)
-        self._glide_odom()
-
-    def _log_arduino_status(self, lines):
-        """Surface Mega pin/PWM proof while diagnosing dead drivers."""
-        now = time.monotonic()
-        if now - getattr(self, '_last_status_log', 0.0) < 1.0:
-            return
-        for line in lines:
-            if line.startswith('S:'):
+                self.counts = None
+                self._send(f'K:{self.k_left:.6f} {self.k_right:.6f}')
+                self.get_logger().info('Mega ready')
+            if not line.startswith('L:'):
+                return
+        if line.startswith('SAFE START READY'):
+            # The Mega rebooted (counts restart at 0): re-send the pulse sizes.
+            self.counts = None
+            self._send(f'K:{self.k_left:.6f} {self.k_right:.6f}')
+            self.get_logger().warn('Mega restarted')
+        elif line.startswith('L:'):
+            self._on_counts(line)
+        elif 'STALL HARD STOP' in line:
+            self.wheel = [0.0, 0.0]
+            self.get_logger().warn(
+                'Mega STALL HARD STOP: a driven wheel stopped turning; wheels off '
+                'for 10 s (jam, obstacle, driver fault or motor power off)')
+        elif line.startswith('K '):
+            self.get_logger().info(f'Mega pulse size: {line}')
+        elif line.startswith('S:'):
+            now = time.monotonic()
+            if now - self._last_status_log >= STATUS_LOG_PERIOD:
                 self._last_status_log = now
                 self.get_logger().info(f'Mega drive {line}')
-                break
 
-    def _spin_wheel_joints(self, dt):
-        """Advance continuous wheel joints for a smooth RViz roll."""
-        step = min(dt, 0.05)
-        self.left_wheel_angle += (self.slewed_vl / self.wheel_radius) * step
-        self.right_wheel_angle += (self.slewed_vr / self.wheel_radius) * step
-
-    def _publish_wheel_joints(self):
-        js = JointState()
-        js.header.stamp = self.get_clock().now().to_msg()
-        js.name = ['left_wheel_joint', 'right_wheel_joint']
-        js.position = [self.left_wheel_angle, self.right_wheel_angle]
-        self.joint_pub.publish(js)
-
-    def _absorb_encoders(self, lines):
-        for line in lines:
-            if not line.startswith('L:'):
-                continue
-            try:
-                parts = line.replace('L:', '').split('R:')
-                left = int(parts[0].strip())
-                right = int(parts[1].strip())
-            except (IndexError, ValueError) as e:
-                self.get_logger().error(f'Parse error: {e}')
-                continue
-
-            now = time.monotonic()
-            if self.last_left is None:
-                self.last_left = left
-                self.last_right = right
-                self.last_enc_mono = now
-                continue
-
-            dt = now - self.last_enc_mono
-            dl = left - self.last_left
-            dr = right - self.last_right
-            self.last_left = left
-            self.last_right = right
-            self.last_enc_mono = now
-
-            max_p = self.get_parameter('max_pulses_per_sample').value
-            if max(abs(dl), abs(dr)) > max_p:
-                continue
-
-            dist = self.get_parameter('distance_per_pulse').value
-            r_mult = self.get_parameter('right_encoder_multiplier').value
-            wheel_base = self.get_parameter('wheel_base').value
-            dl_m = dl * dist
-            dr_m = dr * dist * r_mult
-            if dt <= 0.0:
-                continue
-
-            # Integrate this sample into the pose immediately so RViz moves live.
-            travel = 0.5 * (dl_m + dr_m)
-            dtheta = (dr_m - dl_m) / wheel_base
-            nx = self.x + travel * math.cos(self.theta + 0.5 * dtheta)
-            ny = self.y + travel * math.sin(self.theta + 0.5 * dtheta)
-            if not inside_map(nx, ny):
-                # Keep pose on the map so Nav2 can still plan. Stop drive.
-                self.target_vl = 0.0
-                self.target_vr = 0.0
-                self.slewed_vl = 0.0
-                self.slewed_vr = 0.0
-                self.v_filt = 0.0
-                self.w_filt = 0.0
-                self._publish_odom(0.0, 0.0)
-                continue
-            self.x = nx
-            self.y = ny
-            self.theta += dtheta
-
-            v_meas = travel / dt
-            w_meas = dtheta / dt
-            self.v_filt = 0.75 * v_meas + 0.25 * self.v_filt
-            self.w_filt = 0.75 * w_meas + 0.25 * self.w_filt
-            self._pose_from_enc_at = now
-            self.last_time = time.time()
-            self._publish_odom(self.v_filt, self.w_filt)
-
-    def _glide_odom(self):
-        now = time.time()
-        dt = now - self.last_time
-        if dt <= 0.0 or dt > 0.5:
-            self.last_time = now
-            self._publish_odom(self.v_filt, self.w_filt)
+    # ---------------- odometry ----------------
+    def _on_counts(self, line):
+        try:
+            left_s, right_s = line[2:].split('R:')
+            counts = (int(left_s), int(right_s))
+        except ValueError:
             return
-        self.last_time = now
-
-        # Pose already stepped from the latest encoder packet — only republish TF.
-        if self._pose_from_enc_at and (
-                time.monotonic() - self._pose_from_enc_at < 0.05):
-            self._publish_odom(self.v_filt, self.w_filt)
-            return
-
-        if self.last_enc_mono and (
-                time.monotonic() - self.last_enc_mono > 0.4):
-            self.v_filt *= 0.4
-            self.w_filt *= 0.4
-
-        # Coast between Mega reports so the model keeps moving smoothly.
-        if abs(self.v_filt) > 1e-4 or abs(self.w_filt) > 1e-4:
-            if not self._step_inside_map(self.v_filt, self.w_filt, dt):
-                self.target_vl = 0.0
-                self.target_vr = 0.0
-                self.v_filt = 0.0
-                self.w_filt = 0.0
-        self._publish_odom(self.v_filt, self.w_filt)
-
-    def _wheel_sample(self, lines):
-        """(meters, seconds) since the previous encoder line, or None.
-
-        Counts only increase, so this is distance, not direction. The time
-        span is the gap between wheel reports (about 0.25 s), not the 20 Hz
-        timer. Using the timer made RViz record about one fifth of the
-        real motion.
-        """
-        sample = None
-        for line in lines:
-            if not line.startswith('L:'):
-                continue
-            try:
-                parts = line.replace('L:', '').split('R:')
-                left = int(parts[0].strip())
-                right = int(parts[1].strip())
-            except (IndexError, ValueError):
-                continue
-
-            now = time.monotonic()
-            if self.last_left is None:
-                self.last_left = left
-                self.last_right = right
-                self.last_enc_mono = now
-                sample = (0.0, 0.0)
-                continue
-
-            dt = now - self.last_enc_mono
-            dl = left - self.last_left
-            dr = right - self.last_right
-            self.last_left = left
-            self.last_right = right
-            self.last_enc_mono = now
-
-            if (dt <= 0.0 or dt > 1.0 or dl < 0 or dr < 0
-                    or dl > 120 or dr > 120):
-                sample = (0.0, dt)
-                continue
-
-            dist = self.get_parameter('distance_per_pulse').value
-            r_mult = self.get_parameter('right_encoder_multiplier').value
-            left_m = dl * dist
-            right_m = dr * dist * r_mult
-            travel = wheel_travel(left_m, right_m, MIN_TRAVEL_M)
-            sample = (travel, dt)
-        return sample
-
-    def _note_encoder_motion(self, travel):
-        """Warn once when the motors are driven and both counts stay at 0.
-
-        The encoder LEDs are powered from the Mega 5V pin, not the motor
-        battery. A dark encoder cannot produce a count, so the pose stays put.
-        """
-        moving = abs(self.slewed_vl) > 0.05 or abs(self.slewed_vr) > 0.05
-        if travel >= 0.004 or not moving:
-            self._enc_dead_since = None
-            return
-
         now = time.monotonic()
-        if self._enc_dead_since is None:
-            self._enc_dead_since = now
+        if self.counts is None:
+            self.counts, self.last_report = counts, now
+            self._publish_odom()
             return
-        if self._enc_dead_logged or now - self._enc_dead_since < 2.0:
+        dl_p, dr_p = counts[0] - self.counts[0], counts[1] - self.counts[1]
+        self.counts = counts
+        if max(abs(dl_p), abs(dr_p)) > MAX_PULSES_PER_REPORT:
+            self.get_logger().warn(f'Ignoring a jump of {dl_p}/{dr_p} pulses')
             return
-        self._enc_dead_logged = True
-        self.get_logger().error(
-            'Motors are commanded but both encoder counts stayed at 0. '
-            'Encoder lights need Mega 5V: yellow wire to 5V, black wire to GND.')
+        dl, dr = dl_p * self.k_left, dr_p * self.k_right
+        self.x, self.y, self.theta = integrate(
+            self.x, self.y, self.theta, dl, dr, self.wheel_base)
+        span = now - self.last_report
+        self.last_report = now
+        if span > 0.0:
+            v = 0.5 * (dl + dr) / span
+            w = (dr - dl) / self.wheel_base / span
+            self.v_meas = 0.5 * v + 0.5 * self.v_meas
+            self.w_meas = 0.5 * w + 0.5 * self.w_meas
+        self.wheel_angle[0] += dl / self.wheel_radius
+        self.wheel_angle[1] += dr / self.wheel_radius
+        self._publish_odom()
 
-    def _motors_commanded(self):
-        return abs(self.slewed_vl) > 0.008 or abs(self.slewed_vr) > 0.008
-
-    def _assist_command_odom(self, dt):
-        self._command_open_loop(min(dt, 0.05))
-
-    def command_odom(self, lines):
-        now = time.time()
-        dt = now - self.last_time
-        if dt <= 0.0 or dt > 0.5:
-            self.last_time = now
-            return
-        self.last_time = now
-
-        open_loop = bool(self.get_parameter('open_loop_odom').value)
-
-        if open_loop:
-            if self.drive_confirmed():
-                sample = self._wheel_sample(lines)
-                if sample is not None:
-                    self._note_encoder_motion(sample[0])
-            self._command_open_loop(min(dt, 0.05))
-            return
-
-        if not self.drive_confirmed():
-            self._publish_odom(0.0, 0.0)
-            return
-
-        sample = self._wheel_sample(lines)
-        if sample is None:
-            if self._motors_commanded():
-                self._assist_command_odom(dt)
-            else:
-                self._publish_odom(self.v_filt, self.w_filt)
-            return
-
-        travel, dt_enc = sample
-        self._note_encoder_motion(travel)
-
-        if dt_enc <= 0.0 or travel < MIN_TRAVEL_M:
-            if self._motors_commanded():
-                self._assist_command_odom(dt)
-            else:
-                self.v_filt = 0.0
-                self.w_filt = 0.0
-                self._publish_odom(0.0, 0.0)
-            return
-
-        vl = self.slewed_vl
-        vr = self.slewed_vr
-        wheel_base = self.get_parameter('wheel_base').value
-        wheel = 0.5 * (abs(vl) + abs(vr))
-        if wheel < 0.001:
-            self.v_filt = 0.0
-            self.w_filt = 0.0
-            self._publish_odom(0.0, 0.0)
-            return
-
-        meas = travel / dt_enc
-        scale = min(1.0, meas / wheel)
-        v = 0.5 * (vl + vr) * scale
-        w = (vr - vl) / wheel_base * scale
-        if abs(v) > 1.0:
-            cap = 1.0 / abs(v)
-            v *= cap
-            w *= cap
-
-        self.v_filt = v
-        self.w_filt = w
-        if not self._step_inside_map(v, w, dt_enc):
-            self.target_vl = 0.0
-            self.target_vr = 0.0
-            self.v_filt = 0.0
-            self.w_filt = 0.0
-            self._publish_odom(0.0, 0.0)
-            return
-        self._publish_odom(v, w)
-
-    def _command_open_loop(self, dt):
-        """Advance the pose from commanded wheel speeds for RViz dry-run."""
-        vl = self.slewed_vl
-        vr = self.slewed_vr
-        if abs(vl) < 0.008 and abs(vr) < 0.008:
-            self.v_filt = 0.0
-            self.w_filt = 0.0
-            self._publish_odom(0.0, 0.0)
-            return
-
-        wheel_base = self.get_parameter('wheel_base').value
-        v = 0.5 * (vl + vr)
-        w = (vr - vl) / wheel_base
-        self.v_filt = v
-        self.w_filt = w
-        if not self._step_inside_map(v, w, dt):
-            self.target_vl = 0.0
-            self.target_vr = 0.0
-            self.v_filt = 0.0
-            self.w_filt = 0.0
-            self._publish_odom(0.0, 0.0)
-            return
-        self._publish_odom(v, w)
-
-    def _step_inside_map(self, v, w, dt):
-        """Advance the pose only while it stays on the 28 x 40 ft map."""
-        nx = self.x + v * math.cos(self.theta) * dt
-        ny = self.y + v * math.sin(self.theta) * dt
-        if not inside_map(nx, ny):
-            return False
-        self.x = nx
-        self.y = ny
-        self.theta += w * dt
-        return True
-
-    def _integrate(self, v, w, dt):
-        if not self._step_inside_map(v, w, dt):
-            self.v_filt = 0.0
-            self.w_filt = 0.0
-
-    def _ensure_inside_map(self):
-        """If pose already left the map (old run), snap back to home."""
-        if inside_map(self.x, self.y):
-            return
-        self.get_logger().warn(
-            f'Pose left the map (odom x={self.x:.2f} y={self.y:.2f}); '
-            'resetting to home'
-        )
-        self.x = 0.0
-        self.y = 0.0
-        self.theta = 0.0
-        self.v_filt = 0.0
-        self.w_filt = 0.0
-        self.target_vl = 0.0
-        self.target_vr = 0.0
-        self.slewed_vl = 0.0
-        self.slewed_vr = 0.0
-
-    def _publish_odom(self, v, w):
-        self._ensure_inside_map()
+    def _publish_odom(self):
         stamp = self.get_clock().now().to_msg()
-        q = Quaternion(
-            x=0.0,
-            y=0.0,
-            z=math.sin(self.theta * 0.5),
-            w=math.cos(self.theta * 0.5),
-        )
+        q = Quaternion(z=math.sin(self.theta / 2), w=math.cos(self.theta / 2))
         odom = Odometry()
         odom.header.stamp = stamp
         odom.header.frame_id = 'odom'
@@ -653,10 +289,9 @@ class BaseController(Node):
         odom.pose.pose.position.x = self.x
         odom.pose.pose.position.y = self.y
         odom.pose.pose.orientation = q
-        odom.twist.twist.linear.x = v
-        odom.twist.twist.angular.z = w
+        odom.twist.twist.linear.x = self.v_meas
+        odom.twist.twist.angular.z = self.w_meas
         self.odom_pub.publish(odom)
-
         t = TransformStamped()
         t.header.stamp = stamp
         t.header.frame_id = 'odom'
@@ -665,6 +300,20 @@ class BaseController(Node):
         t.transform.translation.y = self.y
         t.transform.rotation = q
         self.tf_broadcaster.sendTransform(t)
+
+    def _publish_joints(self, dt):
+        if self.counts is None:
+            # No Mega: keep TF alive for Nav2 and RViz (pose unchanged).
+            self._publish_odom()
+        js = JointState()
+        js.header.stamp = self.get_clock().now().to_msg()
+        js.name = ['left_wheel_joint', 'right_wheel_joint']
+        js.position = list(self.wheel_angle)
+        self.joint_pub.publish(js)
+
+    def destroy_node(self):
+        self._close()
+        super().destroy_node()
 
 
 def main(args=None):
@@ -675,7 +324,8 @@ def main(args=None):
     except (KeyboardInterrupt, ExternalShutdownException):
         pass
     node.destroy_node()
-    rclpy.shutdown()
+    if rclpy.ok():
+        rclpy.shutdown()
 
 
 if __name__ == '__main__':

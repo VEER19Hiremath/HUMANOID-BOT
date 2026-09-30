@@ -1,9 +1,16 @@
 #!/usr/bin/env python3
-"""Open the AirPods call link and publish 16 kHz PCM for the voice node.
+"""Bluetooth headset microphone bridge: 16 kHz PCM for the voice node.
 
-PipeWire 1.0.5 answers AT+NREC with an error when no modem is present, so
-the headset drops the link before any samples exist. This process registers
+Works with any paired headset that has the hands-free (HFP) profile: the one
+connected now, else each paired one in turn (the last one that worked
+first). PipeWire 1.0.5 answers AT+NREC with an error when no modem is present,
+so headsets dropped its link before any samples existed; this process acts as
 the hands-free gateway itself, replies OK, and reads the SCO microphone.
+
+Codecs: mSBC (wideband) when the headset negotiates it, else CVSD (8 kHz,
+upsampled to 16 kHz). /tmp/hospital_hfp_mic.up exists only while headset
+audio is flowing; without it the voice node uses the system microphone
+(USB / wired), so any microphone works.
 """
 
 import array
@@ -15,11 +22,14 @@ import subprocess
 import threading
 import time
 
-AIRPODS = "68:CA:C4:DE:B5:2B"
 PCM_SOCK = "/tmp/hospital_hfp_mic.sock"
+LINK_FLAG = "/tmp/hospital_hfp_mic.up"
+LAST_GOOD = os.path.expanduser("~/.hospital_headset")
+HANDSFREE_UUID = "0000111e"
 SOL_BLUETOOTH = 274
 BT_VOICE = 11
-BT_VOICE_TRANSPARENT = 0x0003
+BT_VOICE_TRANSPARENT = 0x0003   # mSBC: raw frames, decoded here
+BT_VOICE_CVSD_16BIT = 0x0060    # CVSD: the adapter delivers 16-bit 8 kHz PCM
 
 # Indicator order shared by AT+CIND=? and AT+CIND?
 CIND_DEF = (
@@ -134,8 +144,37 @@ def _msbc_decoder():
     return decode
 
 
-def read_sco(sco):
-    log("SCO microphone open")
+LINK_UP = False
+
+
+def set_link_flag(up):
+    """Create / remove the link flag once per change, atomically (write a
+    temp file, then rename): the voice node must never read a half-written
+    flag. Rewriting it on every packet made it read empty now and then, so
+    the voice node dropped the headset several times a second."""
+    global LINK_UP
+    if up == LINK_UP:
+        return
+    LINK_UP = up
+    try:
+        if up:
+            tmp = LINK_FLAG + ".tmp"
+            with open(tmp, "w") as f:
+                f.write(str(os.getpid()))
+            os.replace(tmp, LINK_FLAG)
+            log("Headset audio flowing")
+        elif os.path.exists(LINK_FLAG):
+            os.unlink(LINK_FLAG)
+            log("Headset audio stopped")
+    except OSError:
+        pass
+
+
+def read_sco(sco, cvsd=False):
+    log(f"SCO microphone open ({'CVSD' if cvsd else 'mSBC'})")
+    if cvsd:
+        read_sco_cvsd(sco)
+        return
     global CURRENT_RFCOMM
     decode = _msbc_decoder()
     logged = False
@@ -182,20 +221,45 @@ def read_sco(sco):
             else:
                 pcm = b""
             if pcm:
+                set_link_flag(True)
                 AUDIO.write(pcm)
     except OSError as exc:
         log(f"SCO microphone closed: {exc}")
     finally:
-        try:
-            sco.close()
-        except OSError:
-            pass
-        link = CURRENT_RFCOMM
-        if link is not None:
+        close_link(sco)
+
+
+def read_sco_cvsd(sco):
+    """CVSD: 16-bit 8 kHz PCM both ways; answer each packet with silence."""
+    try:
+        while True:
+            data = sco.recv(512)
+            if not data:
+                break
             try:
-                link.close()
+                sco.send(bytes(len(data)))
             except OSError:
                 pass
+            set_link_flag(True)
+            AUDIO.write(upsample_8k_to_16k(data))
+    except OSError as exc:
+        log(f"SCO microphone closed: {exc}")
+    finally:
+        close_link(sco)
+
+
+def close_link(sco):
+    set_link_flag(False)
+    try:
+        sco.close()
+    except OSError:
+        pass
+    link = CURRENT_RFCOMM
+    if link is not None:
+        try:
+            link.close()
+        except OSError:
+            pass
 
 
 class _ScoAddr(ctypes.Structure):
@@ -207,7 +271,7 @@ def _bdaddr(text):
     return [int(part, 16) for part in reversed(text.split(":"))]
 
 
-def connect_sco(adapter, remote):
+def connect_sco(adapter, remote, cvsd=False):
     import select
     sco = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_SEQPACKET, socket.BTPROTO_SCO)
     libc = ctypes.CDLL(None, use_errno=True)
@@ -218,9 +282,8 @@ def connect_sco(adapter, remote):
         if libc.bind(sco.fileno(), ctypes.byref(local), ctypes.sizeof(local)) != 0:
             err = ctypes.get_errno()
             raise OSError(err, os.strerror(err))
-        sco.setsockopt(
-            SOL_BLUETOOTH, BT_VOICE, struct.pack("<H", BT_VOICE_TRANSPARENT)
-        )
+        voice = BT_VOICE_CVSD_16BIT if cvsd else BT_VOICE_TRANSPARENT
+        sco.setsockopt(SOL_BLUETOOTH, BT_VOICE, struct.pack("<H", voice))
         peer = _ScoAddr()
         peer.family = socket.AF_BLUETOOTH
         peer.bdaddr[:] = _bdaddr(remote)
@@ -240,7 +303,7 @@ def connect_sco(adapter, remote):
         log(f"SCO connect failed: {exc}")
         sco.close()
         return False
-    threading.Thread(target=read_sco, args=(sco,), daemon=True).start()
+    threading.Thread(target=read_sco, args=(sco, cvsd), daemon=True).start()
     return True
 
 
@@ -258,6 +321,10 @@ def handle_rfcomm(rfcomm, adapter, remote):
     buf = b""
     slc_ready = False
     sco_started = False
+    # Headset features (AT+BRSF): bit 7 = codec negotiation. Codecs (AT+BAC):
+    # 2 = mSBC. Without both, the call audio is CVSD.
+    codec_negotiation = False
+    msbc = False
     log(f"RFCOMM open for {remote}")
     try:
         while True:
@@ -275,8 +342,15 @@ def handle_rfcomm(rfcomm, adapter, remote):
                 log(f"AT {cmd}")
                 upper = cmd.upper()
                 if upper.startswith("AT+BRSF"):
-                    # Bit 9 is codec negotiation. CVSD is codec 1.
+                    try:
+                        codec_negotiation = bool(int(cmd.split("=", 1)[1]) & (1 << 7))
+                    except (IndexError, ValueError):
+                        codec_negotiation = False
+                    # Our (gateway) features; bit 9 is codec negotiation.
                     send_lines(rfcomm, "+BRSF: 1023", "OK")
+                elif upper.startswith("AT+BAC"):
+                    msbc = "2" in cmd.split("=", 1)[-1].split(",")
+                    send_lines(rfcomm, "OK")
                 elif upper.startswith("AT+CIND=?"):
                     send_lines(rfcomm, f"+CIND: {CIND_DEF}", "OK")
                 elif upper.startswith("AT+CIND?"):
@@ -286,6 +360,14 @@ def handle_rfcomm(rfcomm, adapter, remote):
                 elif upper.startswith("AT+CMER"):
                     send_lines(rfcomm, "OK")
                     slc_ready = True
+                    if not (codec_negotiation and msbc) and not sco_started:
+                        # CVSD headset: no codec step follows. Signal an
+                        # active call so it opens its mic, then open the audio.
+                        time.sleep(0.2)
+                        send_lines(rfcomm, "+VGM:15", "+CIEV: 3,2", "+CIEV: 2,1",
+                                   "+CIEV: 3,0")
+                        time.sleep(0.3)
+                        sco_started = connect_sco(adapter, remote, cvsd=True)
                 elif upper.startswith("AT+BCC"):
                     send_lines(rfcomm, "OK")
                     if slc_ready and not sco_started:
@@ -296,7 +378,7 @@ def handle_rfcomm(rfcomm, adapter, remote):
                         sco_started = connect_sco(adapter, remote)
                 elif upper.startswith("AT+NREC"):
                     send_lines(rfcomm, "OK")
-                    if slc_ready and not sco_started:
+                    if slc_ready and not sco_started and codec_negotiation and msbc:
                         time.sleep(0.2)
                         # Keep an active call so the headset leaves the mic open.
                         send_lines(
@@ -316,6 +398,7 @@ def handle_rfcomm(rfcomm, adapter, remote):
             rfcomm.close()
         except OSError:
             pass
+        set_link_flag(False)
         log("RFCOMM closed")
 
 
@@ -329,28 +412,42 @@ def adapter_address():
     raise RuntimeError("Bluetooth adapter not found")
 
 
-def connected_headset():
-    """Use the headset that is connected now. AirPods stay the fallback."""
+def _bt(*args, timeout=8):
     try:
-        listed = subprocess.check_output(
-            ["bluetoothctl", "devices", "Connected"], text=True, timeout=8
-        )
+        return subprocess.check_output(["bluetoothctl", *args], text=True, timeout=timeout)
     except (OSError, subprocess.SubprocessError):
-        return AIRPODS
-    for line in listed.splitlines():
-        parts = line.split()
-        if len(parts) < 2 or parts[0] != "Device":
-            continue
-        addr = parts[1]
-        try:
-            info = subprocess.check_output(
-                ["bluetoothctl", "info", addr], text=True, timeout=8
-            )
-        except (OSError, subprocess.SubprocessError):
-            continue
-        if "0000111e" in info or "Handsfree" in info:
-            return addr
-    return AIRPODS
+        return ""
+
+
+def _devices(kind):
+    """Addresses from 'bluetoothctl devices <kind>' (Connected / Paired)."""
+    return [line.split()[1] for line in _bt("devices", kind).splitlines()
+            if line.startswith("Device ") and len(line.split()) >= 2]
+
+
+def is_headset(addr):
+    return HANDSFREE_UUID in _bt("info", addr).lower()
+
+
+def headset_candidates():
+    """Headsets to try, best first: connected now, last good, other paired."""
+    try:
+        with open(LAST_GOOD) as f:
+            last = f.read().strip()
+    except OSError:
+        last = ""
+    connected = [a for a in _devices("Connected") if is_headset(a)]
+    paired = [a for a in _devices("Paired") if is_headset(a)]
+    order = connected + ([last] if last in paired else []) + paired
+    return list(dict.fromkeys(order))   # unique, keep order
+
+
+def remember(addr):
+    try:
+        with open(LAST_GOOD, "w") as f:
+            f.write(addr)
+    except OSError:
+        pass
 
 
 def ensure_connected(addr):
@@ -366,12 +463,13 @@ def ensure_connected(addr):
 
 
 def hfp_channel(addr):
+    """RFCOMM channel of the headset's hands-free service, or None."""
     try:
         out = subprocess.check_output(
             ["sdptool", "browse", addr], text=True, timeout=15
         )
     except (OSError, subprocess.SubprocessError):
-        return 2 if addr != AIRPODS else 7
+        return None
     in_handsfree = False
     for line in out.splitlines():
         if "Hands-Free" in line or "Handsfree" in line:
@@ -381,29 +479,56 @@ def hfp_channel(addr):
             return int(line.rsplit(":", 1)[-1].strip())
         if in_handsfree and line.startswith("Service Name:"):
             in_handsfree = False
-    return 7
+    return None
+
+
+def try_headset(adapter, remote):
+    """Run one call link to this headset until it ends. True if it opened."""
+    info = _bt("info", remote)
+    name = info.split("Name: ", 1)[1].splitlines()[0] if "Name: " in info else "?"
+    log(f"Trying headset {remote} ({name})")
+    ensure_connected(remote)
+    channel = hfp_channel(remote)
+    if channel is None:
+        log(f"{remote}: no hands-free service found (off, out of range or busy)")
+        return False
+    rfcomm = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_STREAM, socket.BTPROTO_RFCOMM)
+    rfcomm.settimeout(8)
+    log(f"Opening hands-free channel {channel}")
+    try:
+        rfcomm.connect((remote, channel))
+    except OSError as exc:
+        log(f"{remote}: {exc}")
+        rfcomm.close()
+        return False
+    rfcomm.settimeout(None)
+    remember(remote)
+    handle_rfcomm(rfcomm, adapter, remote)
+    return True
 
 
 def main():
+    set_link_flag(False)
     threading.Thread(target=serve_pcm, daemon=True).start()
     adapter = adapter_address()
     log(f"Headset mic bridge on {adapter}")
+    quiet_since = 0.0
     while True:
-        try:
-            remote = connected_headset()
-            log(f"Using headset {remote}")
-            ensure_connected(remote)
-            channel = hfp_channel(remote)
-            rfcomm = socket.socket(
-                socket.AF_BLUETOOTH, socket.SOCK_STREAM, socket.BTPROTO_RFCOMM
-            )
-            rfcomm.settimeout(8)
-            log(f"Opening hands-free channel {channel}")
-            rfcomm.connect((remote, channel))
-            rfcomm.settimeout(None)
-            handle_rfcomm(rfcomm, adapter, remote)
-        except Exception as exc:
-            log(f"Hands-free link failed: {exc}")
+        candidates = headset_candidates()
+        if not candidates:
+            if time.monotonic() - quiet_since > 30:
+                log("No paired hands-free headset. Pair one (bluetoothctl: pair, trust, "
+                    "connect) or use a USB microphone.")
+                quiet_since = time.monotonic()
+            time.sleep(3)
+            continue
+        for remote in candidates:
+            try:
+                if try_headset(adapter, remote):
+                    break
+            except Exception as exc:
+                log(f"Hands-free link failed: {exc}")
+        set_link_flag(False)
         time.sleep(2)
 
 

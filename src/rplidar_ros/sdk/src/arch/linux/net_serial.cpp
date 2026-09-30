@@ -198,7 +198,7 @@ bool raw_serial::open(const char * portname, uint32_t baudrate, uint32_t flags)
     _is_serial_opened = true;
     _operation_aborted = false;
 
-    //Clear the DTR bit to let the motor spin
+    // Clear the DTR bit to let the motor spin.
     clearDTR();
     do {
         // create self pipeline for wait cancellation

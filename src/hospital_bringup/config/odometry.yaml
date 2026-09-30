@@ -1,0 +1,15 @@
+# Wheel odometry scales for base_controller, loaded by real_robot.launch.py.
+# Written by: python3 scripts/floor_calibrate.py --tape  (measured on the floor)
+# distance_per_pulse: metres per LEFT wheel speed pulse
+# right_encoder_multiplier: right pulse length / left pulse length
+# A wrong ratio makes odometry think the robot turns when it doesn't, so Nav2
+# "corrects" it into circles.
+base_controller:
+  ros__parameters:
+    # Measured on the floor 2026-09-30 (rising edges): odometry said 1.047 m
+    # (87 left / 94 right pulses), the robot really went 3.50 m, slightly
+    # right -> 40.2 mm per pulse, right pulses 0.92 of the left. Counting both
+    # edges was tried and dropped: the right signal adds false edges.
+    # Re-measure after any wheel / driver / wiring change (tape both wheels).
+    distance_per_pulse: 0.0360   # 1 m check at 0.15 m/s: believed 1.13 m, really ~1.0 m
+    right_encoder_multiplier: 0.92

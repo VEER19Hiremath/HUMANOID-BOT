@@ -1,3 +1,10 @@
+"""Real robot hardware: robot model, base controller (Mega), lidar.
+
+static_map_odom:=true (drawn maps): map->odom is fixed at the robot's start
+pose (map_odom_x/y = the map's "# home:"); the robot must start there, facing
++x. false: AMCL (scanned maps) or slam_toolbox (mapping) publishes map->odom.
+"""
+
 import os
 
 from ament_index_python.packages import get_package_share_directory
@@ -16,13 +23,13 @@ def generate_launch_description():
     start_lidar = LaunchConfiguration('start_lidar')
     start_base = LaunchConfiguration('start_base')
     arduino_port = LaunchConfiguration('arduino_port')
-    odom_source = LaunchConfiguration('odom_source')
-    open_loop_odom = LaunchConfiguration('open_loop_odom')
-    idle_close_s = LaunchConfiguration('idle_close_s')
     static_map_odom = LaunchConfiguration('static_map_odom')
+    map_odom_x = LaunchConfiguration('map_odom_x')
+    map_odom_y = LaunchConfiguration('map_odom_y')
 
     desc_pkg = get_package_share_directory('hospital_description')
     rplidar_pkg = get_package_share_directory('rplidar_ros')
+    bringup_dir = get_package_share_directory('hospital_bringup')
     urdf_path = os.path.join(desc_pkg, 'urdf', 'robot.urdf')
 
     return LaunchDescription([
@@ -31,10 +38,9 @@ def generate_launch_description():
         DeclareLaunchArgument('start_lidar', default_value='true'),
         DeclareLaunchArgument('start_base', default_value='true'),
         DeclareLaunchArgument('arduino_port', default_value='/dev/ttyUSB0'),
-        DeclareLaunchArgument('odom_source', default_value='encoder'),
-        DeclareLaunchArgument('open_loop_odom', default_value='false'),
-        DeclareLaunchArgument('idle_close_s', default_value='0.0'),
         DeclareLaunchArgument('static_map_odom', default_value='true'),
+        DeclareLaunchArgument('map_odom_x', default_value='0.0'),
+        DeclareLaunchArgument('map_odom_y', default_value='0.0'),
 
         Node(
             package='robot_state_publisher',
@@ -51,7 +57,8 @@ def generate_launch_description():
             package='tf2_ros',
             executable='static_transform_publisher',
             name='map_to_odom',
-            arguments=['1.60', '1.26', '0.0', '0.0', '0.0', '0.0', 'map', 'odom'],
+            arguments=['--x', map_odom_x, '--y', map_odom_y,
+                       '--frame-id', 'map', '--child-frame-id', 'odom'],
         ),
         Node(
             condition=IfCondition(start_base),
@@ -59,12 +66,10 @@ def generate_launch_description():
             executable='base_controller',
             name='base_controller',
             output='screen',
-            parameters=[{
+            # odometry.yaml: metres per wheel pulse (scripts/floor_calibrate.py)
+            parameters=[os.path.join(bringup_dir, 'config', 'odometry.yaml'), {
                 'use_sim_time': use_sim_time,
                 'arduino_port': arduino_port,
-                'odom_source': odom_source,
-                'open_loop_odom': open_loop_odom,
-                'idle_close_s': idle_close_s,
             }],
         ),
         TimerAction(

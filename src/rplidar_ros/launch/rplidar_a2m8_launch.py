@@ -17,7 +17,9 @@ def generate_launch_description():
     frame_id = LaunchConfiguration('frame_id', default='laser')
     inverted = LaunchConfiguration('inverted', default='false')
     angle_compensate = LaunchConfiguration('angle_compensate', default='true')
-    scan_mode = LaunchConfiguration('scan_mode', default='Sensitivity')
+    # Empty uses the device typical mode, then a standard-scan fallback.
+    # "Sensitivity" is an A3 mode and is not valid for this A2M8.
+    scan_mode = LaunchConfiguration('scan_mode', default='')
     
     return LaunchDescription([
 
@@ -65,7 +67,8 @@ def generate_launch_description():
                          'serial_baudrate': serial_baudrate,
                          'frame_id': frame_id,
                          'inverted': inverted,
-                         'angle_compensate': angle_compensate}],
+                         'angle_compensate': angle_compensate,
+                         'scan_mode': scan_mode}],
             output='screen'),
     ])
 

@@ -599,19 +599,21 @@ namespace sl {
 
 
             ans = checkSupportConfigCommands(ifSupportLidarConf);
-            if (!ans) return ans;
-            if (useTypicalScan){
+            if (!ans) {
+                // Device info can succeed while config queries do not.
+                ifSupportLidarConf = false;
+            }
+            if (useTypicalScan && ifSupportLidarConf){
                 sl_u16 typicalMode;
-                ans = getTypicalScanMode(typicalMode);
-                if (!ans) return ans;
-
-                //call startScanExpress to do the job
-                return startScanExpress(false, typicalMode, 0, outUsedScanMode);
+                sl_result typical_ans = getTypicalScanMode(typicalMode, 500);
+                if (IS_OK(typical_ans)) {
+                    //call startScanExpress to do the job
+                    return startScanExpress(false, typicalMode, 0, outUsedScanMode);
+                }
+                ifSupportLidarConf = false;
             }
 
-            // 'useTypicalScan' is false, just use normal scan mode
-
-
+            // 'useTypicalScan' is false, or typical-mode config timed out.
             return startScanNormal_commonpath(force, ifSupportLidarConf , *outUsedScanMode, DEFAULT_TIMEOUT);
         }
 
@@ -625,24 +627,36 @@ namespace sl {
             if (ifSupportLidarConf) {
 
                 outUsedScanMode.id = SL_LIDAR_CONF_SCAN_COMMAND_STD;
-                ans = getLidarSampleDuration(outUsedScanMode.us_per_sample, outUsedScanMode.id);
-                if (!ans) return ans;
-                ans = getMaxDistance(outUsedScanMode.max_distance, outUsedScanMode.id);
-                if (!ans) return ans;
-                ans = getScanModeAnsType(outUsedScanMode.ans_type, outUsedScanMode.id);
-                if (!ans) return ans;
-                ans = getScanModeName(outUsedScanMode.scan_mode, sizeof(outUsedScanMode.scan_mode), outUsedScanMode.id);
-                if (!ans) return ans;
+                ans = getLidarSampleDuration(outUsedScanMode.us_per_sample, outUsedScanMode.id, 500);
+                if (!ans) {
+                    ifSupportLidarConf = false;
+                } else {
+                    ans = getMaxDistance(outUsedScanMode.max_distance, outUsedScanMode.id, 500);
+                    if (!ans) ifSupportLidarConf = false;
+                }
+                if (ifSupportLidarConf) {
+                    ans = getScanModeAnsType(outUsedScanMode.ans_type, outUsedScanMode.id, 500);
+                    if (!ans) ifSupportLidarConf = false;
+                }
+                if (ifSupportLidarConf) {
+                    ans = getScanModeName(outUsedScanMode.scan_mode, sizeof(outUsedScanMode.scan_mode), outUsedScanMode.id, 500);
+                    if (!ans) ifSupportLidarConf = false;
+                }
 
             }
-            else {
-                // a legacy device
+            if (!ifSupportLidarConf) {
+                // A2 firmware can advertise config commands and then not answer them.
                 rplidar_response_sample_rate_t sampleRateTmp;
-                ans = _getLegacySampleDuration_uS(sampleRateTmp, timeout);
+                ans = _getLegacySampleDuration_uS(sampleRateTmp, 500);
 
-                if (!ans) return SL_RESULT_INVALID_DATA;
+                if (!ans) {
+                    sampleRateTmp.std_sample_duration_us = 476;
+                }
                 outUsedScanMode.us_per_sample = sampleRateTmp.std_sample_duration_us;
-                outUsedScanMode.max_distance = 16;
+                if (outUsedScanMode.us_per_sample == 0) {
+                    outUsedScanMode.us_per_sample = 476;
+                }
+                outUsedScanMode.max_distance = 12;
                 outUsedScanMode.ans_type = SL_LIDAR_ANS_TYPE_MEASUREMENT;
                 strcpy(outUsedScanMode.scan_mode, "Standard");
             }
@@ -990,13 +1004,11 @@ namespace sl {
             switch (_isSupportingMotorCtrl)
             {
             case MotorCtrlSupportNone:
-                if (_transeiver->getBindedChannel()->getChannelType() == CHANNEL_TYPE_SERIALPORT) {
+                if (_transeiver->getBindedChannel()
+                    && _transeiver->getBindedChannel()->getChannelType() == CHANNEL_TYPE_SERIALPORT) {
                     ISerialPortChannel* serialChanel = (ISerialPortChannel*)_transeiver->getBindedChannel();
-                    if (!speed) {
-                        serialChanel->setDTR(true);
-                    }else{
-                        serialChanel->setDTR(false);
-                    }
+                    // DTR low lets this kit's motor spin. DTR high stops it.
+                    serialChanel->setDTR(speed == 0);
                 }
                 break;
             case MotorCtrlSupportPwm:

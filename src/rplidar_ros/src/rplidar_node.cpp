@@ -330,11 +330,24 @@ class RPlidarNode : public rclcpp::Node
                 current_scan_mode.scan_mode, (int)(1000 / current_scan_mode.us_per_sample + 0.5), max_distance, scan_frequency);
             return true;
         }
-        else
+        RCLCPP_WARN(this->get_logger(), "Can not start scan: %08x; falling back to standard scan", op_result);
+        op_result = drv->startScan(false, false, 0, &current_scan_mode);
+        if (SL_IS_OK(op_result))
         {
-            RCLCPP_ERROR(this->get_logger(), "Can not start scan: %08x!", op_result);
-            return false;
+            if (current_scan_mode.us_per_sample <= 0.0f) {
+                current_scan_mode.us_per_sample = 476.0f;
+            }
+            int points_per_circle = (int)(1000 * 1000 / current_scan_mode.us_per_sample / scan_frequency);
+            angle_compensate_multiple = points_per_circle / 360.0 + 1;
+            if (angle_compensate_multiple < 1)
+                angle_compensate_multiple = 1.0;
+            max_distance = (float)current_scan_mode.max_distance;
+            RCLCPP_INFO(this->get_logger(), "current scan mode: %s, sample rate: %d Khz, max_distance: %.1f m, scan frequency:%.1f Hz, ",
+                current_scan_mode.scan_mode, (int)(1000 / current_scan_mode.us_per_sample + 0.5), max_distance, scan_frequency);
+            return true;
         }
+        RCLCPP_ERROR(this->get_logger(), "Can not start scan: %08x!", op_result);
+        return false;
     }
     bool start()
     {

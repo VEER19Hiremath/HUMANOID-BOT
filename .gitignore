@@ -24,5 +24,9 @@ Thumbs.db
 
 # Swap files
 *.swp
-*.swo.tools/
+*.swo
+.tools/
 rviz_gl_fix/
+
+# Robot run logs (start.sh)
+run_logs/

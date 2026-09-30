@@ -24,8 +24,6 @@ setup(
     },
     entry_points={
         'console_scripts': [
-            'wheel_odom = wheel_odometry.odom_node:main',
-            'motor_driver = wheel_odometry.motor_driver:main',
             'teleop_keyboard = wheel_odometry.teleop_keyboard:main',
             'base_controller = wheel_odometry.base_controller:main',
         ],

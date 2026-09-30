@@ -11,9 +11,11 @@ amcl:
     beam_skip_threshold: 0.3
     do_beamskip: false
     global_frame_id: map
+    # Scanned maps (./start.sh map) start where the robot stood: (0, 0).
+    # scripts/pick_rooms.py overwrites this with the picked home.
     initial_pose:
-      x: 1.6
-      y: 1.26
+      x: 0.0
+      y: 0.0
       yaw: 0.0
       z: 0.0
     introspection_mode: disabled
@@ -129,25 +131,45 @@ bt_navigator:
     wait_for_service_timeout: 1000
 collision_monitor:
   ros__parameters:
+    # Body is 0.50 x 0.40 m centred on the lidar (front edge x=0.25).
     PolygonSlow:
       action_type: slowdown
-      enabled: false
+      enabled: true
       min_points: 3
-      points: '[[1.15, 0.35], [1.15, -0.35], [0.80, -0.35], [0.80, 0.35]]'
+      points: '[[1.10, 0.33], [1.10, -0.33], [0.70, -0.33], [0.70, 0.33]]'
       polygon_pub_topic: polygon_slowdown
-      slowdown_ratio: 0.85
+      slowdown_ratio: 0.7   # 0.5 = 0.03 m/s: too little effort to restart a loaded wheel on the floor
       type: polygon
       visualize: true
+    # Stop zone follows the direction of travel: ahead when driving forward,
+    # behind when the planner reverses (short legs to turn round near a
+    # wall). Each starts just past the body so its own parts never trip it.
     PolygonStop:
       action_type: stop
       enabled: true
-      min_points: 5
-      points: '[[0.55, 0.16], [0.55, -0.16], [0.40, -0.16], [0.40, 0.16]]'
+      min_points: 3
       polygon_pub_topic: polygon_stop
-      type: polygon
+      type: velocity_polygon
+      holonomic: false
+      velocity_polygons: [forward, backward]
+      forward:
+        points: '[[0.70, 0.28], [0.70, -0.28], [0.32, -0.28], [0.32, 0.28]]'
+        linear_min: 0.0
+        linear_max: 1.0
+        theta_min: -2.0
+        theta_max: 2.0
+      backward:
+        points: '[[-0.32, 0.28], [-0.32, -0.28], [-0.65, -0.28], [-0.65, 0.28]]'
+        linear_min: -1.0
+        linear_max: 0.0
+        theta_min: -2.0
+        theta_max: 2.0
       visualize: true
     base_frame_id: base_footprint
-    base_shift_correction: true
+    # false: use the latest pose for each scan. Time-matched lookups failed
+    # (TF 1-2 s late on a loaded Pi) and held the robot stopped as "invalid
+    # source"; at 0.06 m/s the shift is under 0.1 m.
+    base_shift_correction: false
     cmd_vel_in_topic: cmd_vel_smoothed
     cmd_vel_out_topic: cmd_vel
     enabled: true
@@ -156,6 +178,7 @@ collision_monitor:
     odom_frame_id: odom
     polygons:
     - PolygonStop
+    - PolygonSlow
     scan:
       enabled: true
       max_height: 2.0
@@ -172,33 +195,33 @@ collision_monitor:
 controller_server:
   ros__parameters:
     FollowPath:
-      allow_reversing: false
+      allow_reversing: false   # forward-only paths (DUBIN)
       approach_velocity_scaling_dist: 0.6
-      desired_linear_vel: 0.12
+      desired_linear_vel: 0.15   # real m/s (calibrated 40 mm/pulse)
       lookahead_dist: 0.8
       lookahead_time: 1.5
       max_allowed_time_to_collision_up_to_carrot: 1.0
-      max_angular_accel: 1.5
+      max_angular_accel: 0.8
       max_lookahead_dist: 1.0
       max_robot_pose_search_dist: 2.0
-      min_approach_linear_velocity: 0.08
+      min_approach_linear_velocity: 0.08   # >= 2 pulses/s per wheel
       min_lookahead_dist: 0.5
       plugin: nav2_regulated_pure_pursuit_controller::RegulatedPurePursuitController
       regulated_linear_scaling_min_radius: 1.0
-      regulated_linear_scaling_min_speed: 0.10
-      rotate_to_heading_angular_vel: 0.45
-      rotate_to_heading_min_angle: 0.35
+      regulated_linear_scaling_min_speed: 0.08
+      rotate_to_heading_angular_vel: 0.20
+      rotate_to_heading_min_angle: 0.785
       transform_tolerance: 0.5
-      use_collision_detection: false
+      use_collision_detection: true   # stop before cutting through a mapped wall
       use_cost_regulated_linear_velocity_scaling: false
       use_regulated_linear_velocity_scaling: true
       use_rotate_to_heading: false
       use_velocity_scaled_lookahead_dist: true
     PathHandler:
-      enforce_path_inversion: false
+      enforce_path_inversion: false   # no reverse cusps with DUBIN
       enforce_path_rotation: false
       inversion_xy_tolerance: 0.2
-      inversion_yaw_tolerance: 0.4
+      inversion_yaw_tolerance: 0.6
       minimum_rotation_angle: 0.785
       plugin: nav2_controller::FeasiblePathHandler
       prune_distance: 2.0
@@ -212,8 +235,9 @@ controller_server:
       path_length_tolerance: 1.0
       plugin: nav2_controller::SimpleGoalChecker
       stateful: true
-      xy_goal_tolerance: 0.25
-      yaw_goal_tolerance: 0.25
+      xy_goal_tolerance: 0.25   # forward-only arcs: at 0.15 a near miss meant another full loop ("circling")
+      # Arcs-only base can't turn on the spot to a final heading: any yaw is fine.
+      yaw_goal_tolerance: 3.15
     goal_checker_plugins:
     - general_goal_checker
     min_theta_velocity_threshold: 0.001
@@ -279,10 +303,16 @@ global_costmap:
       always_send_full_costmap: true
       global_frame: map
       inflation_layer:
-        cost_scaling_factor: 3.0
-        inflation_radius: 0.5
+        # Keep paths in the middle of the free space, away from walls.
+        cost_scaling_factor: 4.0
+        inflation_radius: 0.60
         plugin: nav2_costmap_2d::InflationLayer
       introspection_mode: disabled
+      # Planner: the map only. With a mostly blocked lidar a mark can only be
+      # cleared by a beam that comes back, so people seen once stayed as
+      # permanent obstacles, boxed the robot in and every plan failed ("no
+      # valid path", floor 2026-09-30). Live obstacles: local costmap + the
+      # collision monitor.
       obstacle_layer:
         enabled: false
         observation_sources: scan
@@ -292,10 +322,11 @@ global_costmap:
           data_type: LaserScan
           marking: true
           max_obstacle_height: 2.0
-          obstacle_max_range: 2.5
-          obstacle_min_range: 0.0
-          raytrace_max_range: 3.0
+          obstacle_max_range: 3.0
+          obstacle_min_range: 0.30   # inside = the robot's own parts
+          raytrace_max_range: 3.5
           raytrace_min_range: 0.0
+          inf_is_valid: false
           topic: /scan
       plugins:
       - static_layer
@@ -304,7 +335,10 @@ global_costmap:
       publish_frequency: 2.0
       resolution: 0.05
       robot_base_frame: base_footprint
-      robot_radius: 0.22
+      # Real body: 2 ft long x 1.5 ft wide (0.61 x 0.46 m), centred on the wheels.
+      # robot_radius 0.16 let plans hug walls and the body cross them.
+      footprint: '[[0.31, 0.23], [0.31, -0.23], [-0.31, -0.23], [-0.31, 0.23]]'   # 2 ft x 1.5 ft
+      footprint_padding: 0.02
       static_layer:
         map_subscribe_transient_local: true
         plugin: nav2_costmap_2d::StaticLayer
@@ -328,30 +362,48 @@ local_costmap:
     ros__parameters:
       always_send_full_costmap: true
       global_frame: odom
-      height: 3
+      height: 4
       inflation_layer:
-        cost_scaling_factor: 3.0
-        inflation_radius: 0.5
+        cost_scaling_factor: 4.0
+        inflation_radius: 0.60
         plugin: nav2_costmap_2d::InflationLayer
       introspection_mode: disabled
       plugins:
-      - voxel_layer
+      - obstacle_layer
       - static_layer
       - inflation_layer
       publish_frequency: 2.0
       resolution: 0.05
       robot_base_frame: base_footprint
-      robot_radius: 0.22
+      # Real body: 2 ft long x 1.5 ft wide (0.61 x 0.46 m), centred on the wheels.
+      # robot_radius 0.16 let plans hug walls and the body cross them.
+      footprint: '[[0.31, 0.23], [0.31, -0.23], [-0.31, -0.23], [-0.31, 0.23]]'   # 2 ft x 1.5 ft
+      footprint_padding: 0.02
       rolling_window: true
       static_layer:
         map_subscribe_transient_local: true
         plugin: nav2_costmap_2d::StaticLayer
       update_frequency: 5.0
       use_sim_time: false
-      voxel_layer:
-        enabled: false
-        plugin: nav2_costmap_2d::VoxelLayer
-      width: 3
+      # Live lidar obstacles for the controller (RPP stops before them).
+      # inf_is_valid: a beam with no return clears its line too, so marks
+      # don't outlive the people / objects that made them.
+      obstacle_layer:
+        enabled: true
+        observation_sources: scan
+        plugin: nav2_costmap_2d::ObstacleLayer
+        scan:
+          clearing: true
+          data_type: LaserScan
+          marking: true
+          max_obstacle_height: 2.0
+          obstacle_max_range: 2.0
+          obstacle_min_range: 0.30
+          raytrace_max_range: 3.0
+          raytrace_min_range: 0.0
+          inf_is_valid: true
+          topic: /scan
+      width: 4
 loopback_simulator:
   ros__parameters:
     base_frame_id: base_footprint
@@ -380,11 +432,45 @@ map_server:
     use_sim_time: false
 planner_server:
   ros__parameters:
+    # Hybrid-A* plans only arcs the base can drive (turn radius >= 0.6 m).
+    # DUBIN = forward only. Reverse legs (Reeds-Shepp) changed the wheels'
+    # direction dozens of times per trip, and the left driver doesn't always
+    # follow a direction change made soon after running: one wheel kept
+    # going backwards and the robot spun on the spot (floor 2026-09-30). The
+    # 30 x 40 ft area leaves room for 1.2 m turn-around loops.
     GridBased:
-      allow_unknown: true
-      plugin: nav2_navfn_planner::NavfnPlanner
-      tolerance: 1.0
-      use_astar: false
+      plugin: nav2_smac_planner::SmacPlannerHybrid
+      motion_model_for_search: DUBIN
+      minimum_turning_radius: 0.50   # base_controller allows ~0.46 m
+      reverse_penalty: 6.0
+      change_penalty: 0.0
+      non_straight_penalty: 1.2
+      cost_penalty: 2.0
+      retrospective_penalty: 0.015
+      angle_quantization_bins: 72
+      analytic_expansion_ratio: 3.5
+      analytic_expansion_max_length: 3.0
+      analytic_expansion_max_cost: 200.0
+      analytic_expansion_max_cost_override: false
+      lookup_table_size: 15.0
+      cache_obstacle_heuristic: true
+      downsample_costmap: false
+      downsampling_factor: 1
+      downsample_obstacle_heuristic: true
+      allow_unknown: false
+      tolerance: 0.25
+      max_iterations: 1000000
+      max_on_approach_iterations: 1000
+      max_planning_time: 5.0
+      smooth_path: true
+      debug_visualizations: false
+      smoother:
+        max_iterations: 1000
+        w_smooth: 0.3
+        w_data: 0.2
+        tolerance: 1.0e-10
+        do_refinement: true
+        refinement_num: 2
     allow_partial_planning: false
     costmap_update_timeout: 1.0
     expected_planner_frequency: 2.0
@@ -456,21 +542,22 @@ velocity_smoother:
     - 0.0
     feedback: OPEN_LOOP
     max_accel:
-    - 0.20
+    - 0.15
     - 0.0
-    - 1.5
+    - 0.6
     max_decel:
-    - -0.25
-    - 0.0
-    - -1.5
-    max_velocity:
-    - 0.12
-    - 0.0
-    - 0.20
-    min_velocity:
-    - -0.05
-    - 0.0
     - -0.20
+    - 0.0
+    - -0.6
+    max_velocity:
+    - 0.16
+    - 0.0
+    - 0.12
+    # 0 = navigation never reverses the wheels (see the planner comment).
+    min_velocity:
+    - 0.0
+    - 0.0
+    - -0.12
     odom_duration: 0.1
     odom_topic: odom
     scale_velocities: false
