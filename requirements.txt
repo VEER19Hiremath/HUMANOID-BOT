@@ -16,6 +16,8 @@ pyserial>=3.5          # base_controller.py, bench scripts: talk to the Mega
 numpy>=1.26            # voice level maths, lidar scripts
 scipy>=1.11            # floor_calibrate.py / direction_check.py scan matching
 matplotlib>=3.6        # scripts/render_map.py (docs picture)
+markdown>=3.5          # scripts/make_handover_pdf.py (HANDOVER.md -> PDF)
+pillow>=10.0           # scripts/make_handover_pdf.py (picture sizes)
 
 # Optional: spoken replies through Google TTS (needs internet and a speaker;
 # without it the robot only logs "Going to room ..." / "Arrived")

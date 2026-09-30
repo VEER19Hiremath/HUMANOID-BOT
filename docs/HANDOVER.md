@@ -315,6 +315,7 @@ The current map is **`maps/open_floor.yaml`**: a 20 × 20 ft empty square, with 
 | room3 | (−0.65, −1.10) m | Behind, right |
 
 **What RViz shows** (it opens with `./start.sh`):
+
 - the map;
 - coloured **room zones with names** (the room being driven to is highlighted);
 - the **planned path** in green;
@@ -455,6 +456,7 @@ Runs on its own, independent of ROS. If the Pi stops talking for 300 ms, the mot
   - The brakes are always released (stopping is a coast).
 
 **Key settings at the top of the file:**
+
 - pin numbers;
 - `LEFT_INVERTED` / `RIGHT_INVERTED` (direction polarity);
 - `PWM_MAX` (fuse cap);
@@ -496,31 +498,37 @@ Tests: `src/wheel_odometry/test/test_base_controller_math.py` (9 tests: arc limi
 ### 9.4 `src/hospital_delivery/hospital_delivery/voice_delivery_node.py`: voice control
 
 **Microphone** (`_listen_loop()`):
+
 - **Bluetooth headset.** Audio comes from `scripts/hfp_mic.py` through `/tmp/hospital_hfp_mic.sock`. It's used while the bridge reports audio flowing (`/tmp/hospital_hfp_mic.up`).
 - **Otherwise the system microphone** through PipeWire (`arecord`). Switches automatically both ways.
 - If audio falls more than 1 s behind (busy Pi), old audio is dropped, so "stop" is never late.
 
 **Speech gate** (`_consume_audio()`):
+
 - Only audio above the room's noise floor is fed to the recognizer.
 - **0.5 s before** speech starts and **0.8 s after** it drops are fed too, so a phrase's soft start and its pauses aren't cut.
 
 **Recognizer** (`_new_recognizer()`):
+
 - Vosk, limited to the command phrases of the rooms on the loaded map (`ROOM_ALIASES`).
 - Reports per-word confidence.
 
 **Accepting a command** (`_queue_command()`, `_handle_command()`):
+
 - **"stop"** acts on the first partial guess; a false stop is harmless. It cancels **all** Nav2 goals through the action's cancel service (`stop_robot()`), even if the goal handle was lost, and publishes zero speed.
 - **Room commands** need a **finished** phrase. Every word must have confidence **≥ 0.4** (parameter `min_confidence`), and the phrase must be complete ("room one", "go to room one", "go home"; not a bare "one" or "home").
 - Phrases with unrecognised sound (`[unk]`) are ignored, unless "room \<n\>" or "go home" was heard clearly.
 - The same phrase within 3 s is ignored.
 
 **Goal** (`navigate_to_room()`):
+
 - Position comes from the map file's `# room:` lines.
 - Heading is the bearing from the robot's current position, so it arrives driving straight in.
 - A new goal replaces the old one (Nav2 preempts).
 - `_on_nav_result()` logs "Arrived at …", "ABORTED" or "cancelled".
 
 **Other details:**
+
 - `/voice_command` (`std_msgs/String`) feeds typed text into the same path.
 - Speech output uses Google TTS, then espeak, if installed.
 
@@ -587,6 +595,7 @@ Acts as the "phone" (hands-free audio gateway) for any paired headset. PipeWire'
 | `./start.sh calibrate` | Wheel-distance calibration ([section 8](#8-calibration)) |
 
 The map is chosen in this order:
+
 1. `maps/floor_map.yaml` (if a scan exists);
 2. `maps/open_floor.yaml`;
 3. `maps/area_30x40.yaml`.
