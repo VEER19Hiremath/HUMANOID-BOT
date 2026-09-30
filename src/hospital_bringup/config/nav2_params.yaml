@@ -230,7 +230,9 @@ controller_server:
     controller_plugins:
     - FollowPath
     costmap_update_timeout: 0.3
-    failure_tolerance: 0.3
+    # Something briefly in the way must not abort the trip: the controller
+    # keeps trying this long before asking the planner for a new route.
+    failure_tolerance: 3.0
     general_goal_checker:
       path_length_tolerance: 1.0
       plugin: nav2_controller::SimpleGoalChecker
@@ -308,13 +310,13 @@ global_costmap:
         inflation_radius: 0.60
         plugin: nav2_costmap_2d::InflationLayer
       introspection_mode: disabled
-      # Planner: the map only. With a mostly blocked lidar a mark can only be
-      # cleared by a beam that comes back, so people seen once stayed as
-      # permanent obstacles, boxed the robot in and every plan failed ("no
-      # valid path", floor 2026-09-30). Live obstacles: local costmap + the
-      # collision monitor.
+      # Live obstacles in the plan: the robot detours around people and
+      # objects (inflation keeps a safe distance) and replans when they move.
+      # inf_is_valid: a beam with no return clears its line, so a person who
+      # walked away is forgotten. (Without it, marks in directions with no
+      # returns stayed forever and boxed the robot in, 2026-09-30.)
       obstacle_layer:
-        enabled: false
+        enabled: true
         observation_sources: scan
         plugin: nav2_costmap_2d::ObstacleLayer
         scan:
@@ -322,11 +324,11 @@ global_costmap:
           data_type: LaserScan
           marking: true
           max_obstacle_height: 2.0
-          obstacle_max_range: 3.0
-          obstacle_min_range: 0.30   # inside = the robot's own parts
-          raytrace_max_range: 3.5
+          obstacle_max_range: 2.5
+          obstacle_min_range: 0.35   # inside = the robot's own parts
+          raytrace_max_range: 3.0
           raytrace_min_range: 0.0
-          inf_is_valid: false
+          inf_is_valid: true
           topic: /scan
       plugins:
       - static_layer
@@ -398,7 +400,7 @@ local_costmap:
           marking: true
           max_obstacle_height: 2.0
           obstacle_max_range: 2.0
-          obstacle_min_range: 0.30
+          obstacle_min_range: 0.35
           raytrace_max_range: 3.0
           raytrace_min_range: 0.0
           inf_is_valid: true

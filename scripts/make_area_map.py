@@ -49,15 +49,17 @@ MAPS = {
     },
     'open_floor': {
         # The test area: 20 x 20 ft, robot in the middle facing +x. Three
-        # rooms ~1.5 m (5 ft) out, spread in a triangle so every trip has
-        # open space for the forward-only turn-around loops.
+        # rooms ~1.2-1.3 m (4 ft) out in a triangle. The robot drives
+        # forward only and arrives facing outwards, so it needs ~1.5 m of
+        # floor beyond a room to turn round: at 1.5 m out it ran to within
+        # 0.5 m of the edge and got stuck (floor 2026-10-01).
         'size_ft': (20, 20),
         'walls': [],
         'rooms': {
             'home': (0.00, 0.00),
-            'room1': (1.50, 0.00),    # straight ahead
-            'room2': (-0.75, 1.30),   # back left
-            'room3': (-0.75, -1.30),  # back right
+            'room1': (1.20, 0.00),    # straight ahead
+            'room2': (-0.65, 1.10),   # back left
+            'room3': (-0.65, -1.10),  # back right
         },
     },
 }

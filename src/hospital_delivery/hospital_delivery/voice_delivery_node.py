@@ -137,7 +137,7 @@ class VoiceDeliveryNode(Node):
         # the same as a dead link, so it stopped every trip after 8 s quiet.
         self.declare_parameter("mic_watchdog_s", 0.0)
         # Lowest word confidence (0-1) a room command needs.
-        self.declare_parameter("min_confidence", 0.5)
+        self.declare_parameter("min_confidence", 0.4)
         self._mic_alive_rms = 6.0
         self._mic_alive_at = time.monotonic()
         self._mic_lost = False
@@ -1045,6 +1045,13 @@ class VoiceDeliveryNode(Node):
             return
 
         room = self.extract_room(command)
+        if room is not None and "[unk]" in command and any(
+                f"room {n}" in command for n in ("one", "two", "three", "four", "five")) or \
+                "go home" in command:
+            # A clearly heard "room <number>" / "go home" counts even if the
+            # start of the phrase was garbled ("[unk] room one" on the
+            # headset): drop the unclear part.
+            command = " ".join(w for w in command.split() if w != "[unk]")
         if room is not None and "[unk]" in command:
             # Part of the phrase was noise or other talk ("[unk] gotta toronto"
             # redirected the robot on the floor, 2026-09-30). Only clean
